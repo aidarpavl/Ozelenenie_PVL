@@ -501,7 +501,7 @@ def fetch_osm_roads(timeout=90):
     last = None
     for url in OVERPASS_URLS:
         try:
-            r = requests.post(url, data={"data": q}, timeout=timeout + 30, headers={"User-Agent": "greening-mvp/1.0"})
+            r = requests.post(url, data={"data": q}, timeout=(10, timeout), headers={"User-Agent": "greening-mvp/1.0"})
             r.raise_for_status()
             js = r.json()
             break
@@ -1873,16 +1873,26 @@ def main():
 
     _MODEL["m"] = _cached_model()
 
-    @st.cache_resource(show_spinner="Загрузка дорожного графа OSM для аналитики (однократно)…", ttl=7 * 24 * 3600)
-    def _server_roads():
-        """Реальные дороги для расчётов (расстояния, класс, загрязнение). Общий кэш для всех пользователей."""
-        cached = load_cached("osm_roads.json")
-        if cached:
-            return cached
-        try:
-            return fetch_osm_roads(timeout=60)
-        except Exception:
-            return None
+    @st.cache_resource(show_spinner=False)
+    def _roads_loader():
+        """Дороги OSM для расчётов грузятся в ФОНОВОМ потоке, чтобы страница открывалась сразу.
+        Общий объект для всех пользователей; пока граф не загружен, расчёты помечены как синтетика."""
+        holder = {"roads": load_cached("osm_roads.json"), "status": "ok", "err": ""}
+        if not holder["roads"]:
+            holder["roads"] = None
+            holder["status"] = "loading"
+
+            def _run():
+                try:
+                    holder["roads"] = fetch_osm_roads(timeout=40)
+                    holder["status"] = "ok"
+                except Exception as e:  # noqa
+                    holder["status"] = "error"
+                    holder["err"] = str(e)[:200]
+
+            import threading
+            threading.Thread(target=_run, daemon=True).start()
+        return holder
 
     # ---------- стиль (по мотивам HTML-макета) ----------
     st.markdown("""
@@ -1954,27 +1964,25 @@ div.st-key-page div[role="radiogroup"] label > div:first-child { display:none; }
 </style>""", unsafe_allow_html=True)
 
     # ---------- состояние ----------
-    if "base" not in ss:
-        ss.base = generate_base_data()
-        ss.plants_df = default_plants_df()
-        ss.rates_df = default_rates_df()
-        ss.coeffs_df = default_coeffs_df()
-        ss.extra_zones = []
-        ss.data_ver = 0
-        ss.world_ver = -1
-        ss.selected = "Z-01"
-        ss.ov = {}
-        ss.history = []
-        ss.decisions = []
-        ss.weights = {k: w for k, _, w in FACTORS}
-        ss.last_tip = None
-        ss.processed_drawings = set()
-        ss.osm_roads = _server_roads()
-        ss.osm_social = load_cached("osm_social.json")
+    # Каждый ключ инициализируется отдельно: после обновления кода на Streamlit Cloud старая сессия
+    # сохраняется, и новых полей в ней может не быть.
+    defaults = dict(base=generate_base_data, plants_df=default_plants_df, rates_df=default_rates_df, coeffs_df=default_coeffs_df,
+                    extra_zones=list, data_ver=lambda: 0, world_ver=lambda: -1, selected=lambda: "Z-01", ov=dict, history=list,
+                    decisions=list, weights=lambda: {k: w for k, _, w in FACTORS}, last_tip=lambda: None, processed_drawings=set,
+                    osm_roads=lambda: None, osm_social=lambda: load_cached("osm_social.json"), found_point=lambda: None,
+                    budget=lambda: 45_000_000, zone_ai=lambda: None, app_ver=lambda: 0)
+    for k_, f_ in defaults.items():
+        if k_ not in ss:
+            ss[k_] = f_()
+    if ss.get("page") not in PAGES:
         ss.page = PAGES[0]
-        ss.found_point = None
-        ss.budget = 45_000_000
-        ss.zone_ai = None
+    if ss.app_ver != 2:  # структура мира изменилась в этой версии — пересобрать
+        ss.app_ver = 2
+        ss.world_ver = -1
+    roads_holder = _roads_loader()
+    if ss.osm_roads is None and roads_holder["roads"]:
+        ss.osm_roads = roads_holder["roads"]
+        ss.data_ver += 1
 
     def bump():
         ss.data_ver += 1
@@ -2023,7 +2031,8 @@ div.st-key-page div[role="radiogroup"] label > div:first-child { display:none; }
                 for j, zid in enumerate(h["zones"][:8]):
                     cols[j % len(cols)].button(f"📍{zid}", key=f"sb_{i}_{zid}", on_click=goto_zone, args=(zid,))
             st.divider()
-        st.caption(f"Дороги на карте: OSM (загружаются в браузере). Аналитика по дорогам: {'OSM' if W.roads_real else SYN}. "
+        _rs = {"ok": "OSM", "loading": "OSM загружается в фоне — пока " + SYN, "error": "Overpass недоступен с сервера — " + SYN}[roads_holder["status"]]
+        st.caption(f"Дороги на карте: OSM (загружаются в браузере). Аналитика по дорогам: {'OSM' if W.roads_real else _rs}. "
                    f"Соцобъекты: {'OSM' if W.social_real else SYN}. Зоны/почвы/насаждения: {SYN}.")
 
     # ---------- шапка ----------
