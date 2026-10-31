@@ -1,0 +1,9 @@
+services:
+  greening:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      - DGIS_API_KEY=${DGIS_API_KEY:-}
+    volumes:
+      - ./data:/app/data

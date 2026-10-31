@@ -1,0 +1,11 @@
+streamlit>=1.40,<1.50
+streamlit-folium>=0.22
+folium>=0.17
+pandas>=2.0
+numpy>=1.26
+scikit-learn>=1.3
+openpyxl>=3.1
+reportlab>=4.0
+matplotlib>=3.7   # только шрифт DejaVu с кириллицей для PDF
+pyshp>=2.3        # импорт Shapefile (zip)
+requests>=2.31
