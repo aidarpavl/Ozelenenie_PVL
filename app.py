@@ -488,23 +488,35 @@ def generate_base_data(seed=42, n_zones=26):
 
 # ---------------- OSM / Overpass ----------------
 OVERPASS = "https://overpass-api.de/api/interpreter"
+OVERPASS_URLS = [OVERPASS, "https://overpass.kumi.systems/api/interpreter", "https://overpass.private.coffee/api/interpreter"]
 
 
-def fetch_osm_roads(timeout=120):
-    """Загружает дорожный граф Павлодара из OSM и кэширует в data/osm_roads.json."""
+def fetch_osm_roads(timeout=90):
+    """Загружает дорожный граф Павлодара из OSM (без внутриквартальных проездов и тротуаров — для аналитики
+    их не нужно) и кэширует в data/osm_roads.json. Пробует несколько серверов Overpass."""
     import requests
     S, W, N, E = BBOX
-    q = (f'[out:json][timeout:{timeout}];way["highway"~"^(motorway|trunk|primary|secondary|tertiary|unclassified|'
-         f'residential|living_street|service|pedestrian|footway)$"]({S},{W},{N},{E});out geom tags;')
-    r = requests.post(OVERPASS, data={"data": q}, timeout=timeout + 30, headers={"User-Agent": "greening-mvp/1.0"})
-    r.raise_for_status()
+    q = (f'[out:json][timeout:{timeout}];way["highway"~"^(motorway|motorway_link|trunk|trunk_link|primary|primary_link|'
+         f'secondary|secondary_link|tertiary|tertiary_link|unclassified|residential|living_street|pedestrian)$"]({S},{W},{N},{E});out geom tags;')
+    last = None
+    for url in OVERPASS_URLS:
+        try:
+            r = requests.post(url, data={"data": q}, timeout=timeout + 30, headers={"User-Agent": "greening-mvp/1.0"})
+            r.raise_for_status()
+            js = r.json()
+            break
+        except Exception as e:  # noqa
+            last = e
+    else:
+        raise last
     roads = []
-    for el in r.json().get("elements", []):
+    for el in js.get("elements", []):
         g = el.get("geometry")
         if not g or len(g) < 2:
             continue
         t = el.get("tags", {})
-        roads.append(dict(rid=f"R-{el['id']}", name=t.get("name", "без названия"), highway=t.get("highway"),
+        hw = str(t.get("highway", "")).replace("_link", "")
+        roads.append(dict(rid=f"R-{el['id']}", name=t.get("name", "без названия"), highway=hw,
                           line=[(p["lon"], p["lat"]) for p in g], oneway=t.get("oneway", "no"), lanes=t.get("lanes", ""),
                           surface=t.get("surface", ""), maxspeed=t.get("maxspeed", ""),
                           bridge=t.get("bridge") == "yes", tunnel=t.get("tunnel") == "yes",
@@ -1389,6 +1401,46 @@ def _assistant_answer(q, W, selected=None, weights=None):
         lines.append(f"\nИспользовано {fmt_tg(spent)} из {fmt_tg(b)}, CO₂ за 20 лет ≈ {df["CO₂ за 20 лет, т"].sum():.0f} т. _Оценка._")
         return "\n".join(lines), list(df["Зона"]), "budget_roadmap"
 
+    if "почему" in t and find_species(t, W.C["plants"]):
+        if not z:
+            return "Выберите зону, чтобы объяснить выбор видов.", [], "suitability"
+        p = find_species(t, W.C["plants"])[0]
+        sc, info = suitability(p, z, W.C["coeffs"])
+        V = VARIANTS["Оптимальный"]
+        sv = predict_survival(p, z, V["watering"], V["age"], V["care_years"])
+        inplan = [l for l in W.plan(z["id"])["lines"] if l["name"] == p["name"]]
+        txt = [f"**{p['name']} в зоне {z['id']}** ({z['purpose']}, {z['soil_type']}, засоление {z['salinity']} дСм/м, pH {z['ph']}, "
+               f"нагрузка от дорог {z['road_exposure']:.2f}):"]
+        if sc is None:
+            txt.append(f"- ❌ Исключён жёстким ограничением: {info}.")
+        else:
+            txt.append(f"- Пригодность {sc:.0f}/100" + (" — вид уже в плане." if inplan else " — в план не вошёл: у других видов яруса оценка выше."))
+            minus = [w for w in info if w.startswith("−")]
+            if minus:
+                txt.append("- Минусы: " + "; ".join(w[2:] for w in minus))
+        if p["allergen"]:
+            txt.append("- Сильный аллерген (пыльца/пух) — ограничен у школ, больниц и во дворах.")
+        if p["invasive"]:
+            txt.append("- Инвазивный вид — ограничивать в новых посадках.")
+        txt.append(f"- Прогноз приживаемости через 3 года: {sv['p3']:.0%}. _Оценка._")
+        return "\n".join(txt), [z["id"]], "suitability + predict_survival"
+
+    if "аудит" in t or "анализ зон" in t:
+        if not z:
+            return "Выберите зону для экспресс-аудита.", [], "zone_audit"
+        p = W.plan(z["id"])
+        a = p["avg_surv"]
+        txt = [f"**Экспресс-аудит зоны {z['id']} «{z['name']}»:**",
+               f"- Площадь {fmt_tg(z['area_m2'])[:-2]} м², под посадку {fmt_tg(p['plantable_m2'])[:-2]} м², доля зелени {z['green_share']:.0%}.",
+               f"- Почва: {z['soil_type']}, pH {z['ph']}, засоление {z['salinity']} дСм/м, плодородие {z['fertility']}/5.",
+               f"- Ближайшая дорога: {z['road_name']} ({z['road_class_ru']}, {z['dist_road']:.0f} м).",
+               f"- Приживаемость (1/2/3 г.): {a['p1']:.0%} / {a['p2']:.0%} / {a['p3']:.0%}." if a["p1"] is not None else "- В плане нет деревьев и кустарников.",
+               f"- Смета «Оптимальный»: {fmt_tg(p['estimate']['total'])}; CO₂ за 20 лет ≈ {p['eco']['co2_cum20_t']:.1f} т."]
+        if z["problems"]:
+            txt.append("- Проблемы: " + "; ".join(f"{q['Проблема']} ({q['Острота']})" for q in z["problems"]))
+        txt.append("_Оценка; решение принимает специалист._")
+        return "\n".join(txt), [z["id"]], "zone_audit"
+
     if "замен" in t:
         sp = find_species(t, W.C["plants"])
         if len(sp) < 2:
@@ -1631,6 +1683,140 @@ def make_html(W, zid, plan, prio_df, care_df):
     return "".join(parts).encode("utf-8")
 
 
+def make_passport_html(W, zid, plan):
+    """«Паспорт объекта озеленения» — печатная форма (браузер → Печать → PDF)."""
+    z = W.zone(zid)
+    sel, surv, eco = plan_tables(plan)
+    e10 = plan["eco"]["by_year"][10]
+    css = ("body{font-family:Arial,sans-serif;margin:32px;color:#0f172a}h1{font-size:18px;border-bottom:2px solid #059669;padding-bottom:6px}"
+           "h3{font-size:14px;margin-top:20px}table{border-collapse:collapse;width:100%;font-size:12px}td,th{border:1px solid #cbd5e1;padding:4px 6px;text-align:left}"
+           "th{background:#ecfdf5}.note{font-size:11px;color:#64748b;margin-top:18px}")
+    soil = pd.DataFrame([("Адрес / район", f"{z['name']}, {z['district']} район"), ("Назначение", z["purpose"]),
+                         ("Площадь участка", f"{round(z['area_m2']):,} м²".replace(",", " ")),
+                         ("Площадь под посадку", f"{round(plan['plantable_m2']):,} м²".replace(",", " ")),
+                         ("Доля зелени сейчас", f"{z['green_share']:.0%}"),
+                         ("Почва", f"{z['soil_type']}, pH {z['ph']}, засоление {z['salinity']} дСм/м, плодородие {z['fertility']}/5, влажность {z['moisture']}/5"),
+                         ("Ближайшая дорога", f"{z['road_name']} ({z['road_class_ru']}), {z['dist_road']:.0f} м"),
+                         ("Соцобъекты в 500 м", f"{z['social_n']} ({z['social_list']})"),
+                         ("Источник данных", z.get("src", ""))], columns=["Параметр", "Значение"])
+    summ = pd.DataFrame([("Вариант", plan["variant"]), ("Итого по смете", fmt_tg(plan["estimate"]["total"])),
+                         ("Приживаемость 1/2/3 г.", " / ".join(f"{plan['avg_surv'][k]:.0%}" for k in ("p1", "p2", "p3")) if plan["avg_surv"]["p1"] is not None else "—"),
+                         ("CO₂ через 10 лет", f"{e10['co2_t']:.2f} т/год"), ("Снижение t° через 10 лет", f"{e10['cooling_c']:.2f} °C"),
+                         ("Стоимость 1 т CO₂ (20 лет)", fmt_tg(plan["eco"]["cost_per_t"] or 0))], columns=["Показатель", "Значение"])
+    h = [f"<html><head><meta charset='utf-8'><title>Паспорт объекта озеленения {zid}</title><style>{css}</style></head><body>",
+         f"<h1>ПАСПОРТ ОБЪЕКТА ОЗЕЛЕНЕНИЯ: {z['name'].upper()} ({zid})</h1>",
+         f"<p>Отдел благоустройства и озеленения, г. Павлодар · сформировано {datetime.datetime.now():%d.%m.%Y %H:%M}</p>",
+         "<h3>1. Физико-географические и почвенные параметры</h3>", soil.to_html(index=False),
+         "<h3>2. Спецификация посадочного материала</h3>", sel.drop(columns=["Обоснование"]).to_html(index=False),
+         "<h3>3. Смета</h3>", plan["estimate"]["table"].drop(columns=["Доля"]).to_html(index=False),
+         "<h3>4. Сводка: приживаемость и экологический эффект (оценка)</h3>", summ.to_html(index=False),
+         "<h3>5. Прогноз приживаемости по видам</h3>", surv.to_html(index=False),
+         f"<p class='note'>{DISCLAIMER} Расценки и коэффициенты — из справочников системы, источники указаны там. "
+         f"Данные с пометкой «синтетика» — демонстрационные.</p></body></html>"]
+    return "".join(h).encode("utf-8")
+
+
+# Слой дорог для карты: реальная геометрия OSM грузится В БРАУЗЕРЕ (Overpass API) и кэшируется в localStorage.
+# Подложка Voyager без подписей + слой подписей поверх дорог (текст идёт по изгибу улиц).
+ROADS_JS = r"""
+(function(){
+  var map = %MAP%;
+  var BBOX = [52.215, 76.880, 52.360, 77.110];
+  var URLS = ['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter','https://overpass.private.coffee/api/interpreter'];
+  var CACHE = 'pvl_osm_roads_v2';
+  var CL = {
+    motorway:{ru:'Магистраль скоростного движения',w:7,c:'#e8590c',z:9,mz:0}, trunk:{ru:'Магистраль общегородского значения',w:7,c:'#e8590c',z:9,mz:0},
+    primary:{ru:'Магистраль общегородского значения',w:6,c:'#f59f00',z:8,mz:0}, secondary:{ru:'Улица районного значения',w:5,c:'#fcc419',z:7,mz:0},
+    tertiary:{ru:'Улица районного значения',w:4.5,c:'#ffe066',z:6,mz:12}, unclassified:{ru:'Местный проезд',w:3,c:'#ffffff',z:5,mz:14},
+    residential:{ru:'Жилая улица',w:3,c:'#ffffff',z:5,mz:14}, living_street:{ru:'Жилая зона',w:2.5,c:'#f8f9fa',z:4,mz:15},
+    pedestrian:{ru:'Пешеходная улица',w:2.5,c:'#fcc2d7',z:3,mz:15}, service:{ru:'Внутриквартальный проезд',w:1.8,c:'#f1f3f5',z:2,mz:16},
+    footway:{ru:'Пешеходная дорожка',w:1.2,c:'#e64980',z:1,mz:16}
+  };
+  var MAIN = 'motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|unclassified|residential|living_street|pedestrian';
+  var MINOR = 'service|footway';
+  var ROADS = [], ids = {}, cells = {};
+  map.createPane('gzRoads'); map.getPane('gzRoads').style.zIndex = 350;
+  map.createPane('gzLabels'); map.getPane('gzLabels').style.zIndex = 450; map.getPane('gzLabels').style.pointerEvents = 'none';
+  if (%LABELS%) L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}{r}.png', {pane:'gzLabels', maxZoom:19, subdomains:'abcd'}).addTo(map);
+  var R = L.canvas({pane:'gzRoads', padding:0.5, tolerance:6});
+  var group = L.layerGroup().addTo(map);
+  var st = L.control({position:'bottomright'});
+  var stEl; st.onAdd = function(){ stEl = L.DomUtil.create('div'); stEl.style.cssText='background:rgba(15,23,42,.88);color:#fff;font:11px Inter,Arial,sans-serif;padding:4px 9px;border-radius:999px'; return stEl; }; st.addTo(map);
+  function status(t, ok){ if (stEl) stEl.innerHTML = '<span style="color:'+(ok===false?'#fca5a5':ok?'#86efac':'#fde68a')+'">●</span> '+t; }
+  function cls(hw){ hw = (hw||'').replace('_link',''); return CL[hw] ? hw : null; }
+  function q(query){
+    var i = 0;
+    function next(){
+      if (i >= URLS.length) return Promise.reject('all failed');
+      var u = URLS[i++];
+      return fetch(u, {method:'POST', body:'data='+encodeURIComponent(query), headers:{'Content-Type':'application/x-www-form-urlencoded'}})
+        .then(function(r){ if(!r.ok) throw r.status; return r.json(); }).catch(function(){ return next(); });
+    }
+    return next();
+  }
+  function add(els){
+    var n = 0;
+    (els||[]).forEach(function(el){
+      if (el.type!=='way' || !el.geometry || el.geometry.length<2 || ids[el.id]) return;
+      var t = el.tags||{}, c = cls(t.highway); if (!c) return;
+      ids[el.id] = 1; n++;
+      ROADS.push({id:el.id, hw:t.highway, c:c, name:t.name||'', lanes:t.lanes||'', oneway:t.oneway==='yes',
+        bridge:t.bridge==='yes'||t.bridge==='viaduct', tunnel:t.tunnel==='yes', maxspeed:t.maxspeed||'',
+        pts:el.geometry.map(function(p){return [Math.round(p.lat*1e6)/1e6, Math.round(p.lon*1e6)/1e6];})});
+    });
+    return n;
+  }
+  function len(p){ var s=0; for (var i=1;i<p.length;i++) s += map.distance(p[i-1], p[i]); return s; }
+  function info(r, ll){
+    var s = CL[r.c], L0 = len(r.pts), major = ['motorway','trunk','primary','secondary','tertiary'].indexOf(r.c) >= 0;
+    L.popup().setLatLng(ll).setContent('<div style="font:12px/1.45 Inter,Arial,sans-serif"><b>'+(r.name||'Улица без названия')+'</b><br>Класс: '+s.ru+
+      ' <span style="color:#868e96">(highway='+r.hw+')</span><br>Длина сегмента: '+Math.round(L0).toLocaleString('ru-RU')+' м'+
+      (r.lanes?'<br>Полос: '+r.lanes:'')+(r.oneway?'<br>Одностороннее движение':'')+(r.bridge?'<br>Мост / путепровод':'')+
+      (r.maxspeed?'<br>Ограничение скорости: '+r.maxspeed:'')+
+      (major?'<hr style="margin:4px 0">Защитная полоса вдоль сегмента (оценка): ~'+(Math.floor(L0/8)*2)+' деревьев, ~'+(Math.floor(L0/0.7)*2).toLocaleString('ru-RU')+' кустарников':'')+
+      '<div style="color:#868e96;font-size:10px;margin-top:3px">© OpenStreetMap contributors</div></div>').openOn(map);
+  }
+  function draw(){
+    group.clearLayers();
+    var zm = map.getZoom(), k = Math.max(0.45, Math.min(2.6, Math.pow(2, (zm-15)*0.55)));
+    var vis = ROADS.filter(function(r){ return zm >= CL[r.c].mz; });
+    [-1,0,1].forEach(function(lv){
+      var g = vis.filter(function(r){ return (r.bridge?1:(r.tunnel?-1:0)) === lv; }).sort(function(a,b){ return CL[a.c].z - CL[b.c].z; });
+      g.forEach(function(r){ var s = CL[r.c]; if (s.w >= 2.5) L.polyline(r.pts, {renderer:R, color: lv===1?'#343a40':'#868e96', weight: s.w*k+(lv===1?3:2),
+        opacity: lv===-1?0.3:0.85, interactive:false, lineCap:'round', lineJoin:'round'}).addTo(group); });
+      g.forEach(function(r){ var s = CL[r.c];
+        var pl = L.polyline(r.pts, {renderer:R, color:s.c, weight:s.w*k, opacity: lv===-1?0.45:1,
+          dashArray: lv===-1?'6 6':(r.c==='footway'?'3 4':null), lineCap:'round', lineJoin:'round'}).addTo(group);
+        pl.bindTooltip((r.name||'без названия')+' · '+s.ru, {sticky:true, className:'gz-road-label'});
+        pl.on('click', function(e){ info(r, e.latlng); });
+      });
+    });
+  }
+  function minor(){
+    if (map.getZoom() < 16 || !ROADS.length) return;
+    var b = map.getBounds(), step = 0.01, todo = [];
+    for (var la = Math.floor(b.getSouth()/step)*step; la < b.getNorth(); la += step)
+      for (var lo = Math.floor(b.getWest()/step)*step; lo < b.getEast(); lo += step) {
+        var key = la.toFixed(2)+','+lo.toFixed(2); if (!cells[key]) { cells[key] = 1; todo.push([la, lo]); } }
+    if (!todo.length) return;
+    var query = '[out:json][timeout:60];(' + todo.map(function(c){ return 'way["highway"~"^('+MINOR+')$"]('+c[0].toFixed(4)+','+c[1].toFixed(4)+','+(c[0]+step).toFixed(4)+','+(c[1]+step).toFixed(4)+');'; }).join('') + ');out tags geom;';
+    q(query).then(function(js){ if (add(js.elements)) draw(); }).catch(function(){ todo.forEach(function(c){ delete cells[c[0].toFixed(2)+','+c[1].toFixed(2)]; }); });
+  }
+  function ready(src){ status('Дороги OSM: '+ROADS.length+' сегментов'+(src?' ('+src+')':''), true); draw(); minor(); }
+  map.on('zoomend', draw); map.on('moveend', minor);
+  var cached = null;
+  try { cached = JSON.parse(localStorage.getItem(CACHE)||'null'); } catch(e) {}
+  if (cached && Date.now() - cached.t < 7*24*3600*1000 && cached.r && cached.r.length) { cached.r.forEach(function(r){ ids[r.id]=1; ROADS.push(r); }); ready('кэш'); return; }
+  status('Загрузка улиц из OpenStreetMap…');
+  q('[out:json][timeout:90];way["highway"~"^('+MAIN+')$"]('+BBOX.join(',')+');out tags geom;').then(function(js){
+    add(js.elements);
+    try { localStorage.setItem(CACHE, JSON.stringify({t:Date.now(), r:ROADS})); } catch(e) {}
+    ready('');
+  }).catch(function(){ status('Не удалось загрузить дороги OSM — улицы видны на подложке', false); });
+})();
+"""
+
+
 # =============================================================================
 # 7. ВЕБ-ИНТЕРФЕЙС (Streamlit)
 # =============================================================================
@@ -1638,57 +1824,134 @@ def main():
     import streamlit as st
     import folium
     from folium.plugins import Draw
+    from branca.element import MacroElement, Element
+    from jinja2 import Template
     try:
         from streamlit_folium import st_folium
     except ImportError:
         st_folium = None
     import streamlit.components.v1 as components
 
-    st.set_page_config(page_title="AI-озеленение города", page_icon="🌳", layout="wide")
+    st.set_page_config(page_title="AI-озеленение Павлодара", page_icon="🌳", layout="wide", initial_sidebar_state="collapsed")
     ss = st.session_state
 
     # --- совместимость версий Streamlit ---
-    # Начиная с 1.50 вместо use_container_width используется width="stretch".
     try:
         _ver = tuple(int(x) for x in re.findall(r"\d+", st.__version__)[:2])
     except Exception:
         _ver = (1, 40)
     WIDE = {"width": "stretch"} if _ver >= (1, 50) else {"use_container_width": True}
 
-    def chart(data, kind="bar", grouped=False):
-        """Графики через Vega-Lite без altair (altair 5 не импортируется на Python 3.14).
-        При любой ошибке показывается таблица — страница не падает."""
+    def chart(data, kind="bar", grouped=False, height=280):
+        """Графики через Vega-Lite без altair (altair 5 не импортируется на Python 3.14)."""
         df = data.to_frame() if isinstance(data, pd.Series) else data.copy()
         df = df.reset_index()
         x = df.columns[0]
-        df[x] = df[x].astype(str) if kind == "bar" else df[x]
+        if kind == "bar":
+            df[x] = df[x].astype(str)
         long = df.melt(id_vars=x, var_name="Серия", value_name="Значение")
         multi = long["Серия"].nunique() > 1
         enc = {"x": {"field": x, "type": "nominal" if kind == "bar" else "quantitative", "sort": None, "title": None},
                "y": {"field": "Значение", "type": "quantitative", "title": None,
-                     **({"stack": None} if (grouped or kind != "bar" and multi) else {})},
+                     **({"stack": None} if (grouped or (kind != "bar" and multi)) else {})},
                "tooltip": [{"field": x}, {"field": "Серия"}, {"field": "Значение", "format": ",.2f"}]}
         if multi:
-            enc["color"] = {"field": "Серия", "type": "nominal", "title": None, "legend": {"orient": "bottom"}}
+            enc["color"] = {"field": "Серия", "type": "nominal", "title": None, "legend": {"orient": "bottom"},
+                            "scale": {"range": ["#059669", "#0d5c9c", "#f59e0b", "#e11d48", "#7c3aed", "#0891b2"]}}
             if grouped:
                 enc["xOffset"] = {"field": "Серия"}
-        spec = {"mark": {"type": kind, "tooltip": True, **({"point": True} if kind == "line" else {})}, "encoding": enc, "height": 280}
+        mark = {"type": kind, "tooltip": True, **({"point": True} if kind == "line" else {}),
+                **({"color": "#059669"} if not multi else {}), **({"cornerRadiusEnd": 3} if kind == "bar" else {})}
         try:
-            st.vega_lite_chart(long, spec, **WIDE)
+            st.vega_lite_chart(long, {"mark": mark, "encoding": enc, "height": height}, **WIDE)
         except Exception:
             st.dataframe(data, **WIDE)
-
-    def chart_line(data):
-        chart(data, "line")
-
-    def chart_area(data):
-        chart(data, "area")
 
     @st.cache_resource(show_spinner="Обучение модели приживаемости…")
     def _cached_model():
         return train_survival_model()
 
-    _MODEL["m"] = _cached_model()  # скрипт перезапускается при каждом действии — модель берём из кэша
+    _MODEL["m"] = _cached_model()
+
+    @st.cache_resource(show_spinner="Загрузка дорожного графа OSM для аналитики (однократно)…", ttl=7 * 24 * 3600)
+    def _server_roads():
+        """Реальные дороги для расчётов (расстояния, класс, загрязнение). Общий кэш для всех пользователей."""
+        cached = load_cached("osm_roads.json")
+        if cached:
+            return cached
+        try:
+            return fetch_osm_roads(timeout=60)
+        except Exception:
+            return None
+
+    # ---------- стиль (по мотивам HTML-макета) ----------
+    st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap');
+html, body, [class*="css"], .stMarkdown, .stText, button, input, textarea, select { font-family: 'Inter', sans-serif; }
+header[data-testid="stHeader"] { background: transparent; height: 2.2rem; }
+.block-container { padding-top: 1.2rem; padding-bottom: 2rem; max-width: 100%; }
+.gz-head { background:#0f172a; color:#fff; border-radius:12px; padding:12px 16px; display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+.gz-logo { width:38px; height:38px; border-radius:10px; background:linear-gradient(45deg,#059669,#34d399); display:flex; align-items:center; justify-content:center; font-size:20px; }
+.gz-title { font-weight:700; font-size:16px; }
+.gz-badge { font:500 10px 'JetBrains Mono',monospace; background:rgba(16,185,129,.18); color:#6ee7b7; border:1px solid rgba(16,185,129,.35); padding:1px 7px; border-radius:5px; margin-left:8px; }
+.gz-sub { font-size:11px; color:#94a3b8; margin-top:2px; }
+.gz-sub b { color:#34d399; font-weight:500; }
+.gz-right { text-align:right; font-size:11px; color:#94a3b8; }
+.gz-right .v { font:700 13px 'JetBrains Mono',monospace; color:#fbbf24; }
+.gz-role { display:inline-block; margin-left:10px; background:#1e293b; border:1px solid #334155; color:#cbd5e1; padding:3px 9px; border-radius:999px; font-size:11px; }
+div.st-key-page { margin-top: 8px; }
+div.st-key-page div[role="radiogroup"] { background:#1e293b; padding:4px; border-radius:10px; gap:2px; flex-wrap:wrap; }
+div.st-key-page div[role="radiogroup"] label { background:transparent; padding:5px 11px; border-radius:7px; margin:0 !important; cursor:pointer; }
+div.st-key-page div[role="radiogroup"] label p { color:#94a3b8 !important; font-size:12.5px; font-weight:500; }
+div.st-key-page div[role="radiogroup"] label:hover p { color:#fff !important; }
+div.st-key-page div[role="radiogroup"] label:has(input:checked) { background:#334155; box-shadow:0 1px 2px rgba(0,0,0,.3); }
+div.st-key-page div[role="radiogroup"] label:has(input:checked) p { color:#fff !important; }
+div.st-key-page div[role="radiogroup"] label > div:first-child { display:none; }
+.gz-card { background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:9px 11px; height:100%; }
+.gz-card .l { font-size:10.5px; color:#94a3b8; }
+.gz-card .v { font:700 15px 'JetBrains Mono',monospace; color:#1e293b; }
+.gz-card .s { font-size:10.5px; color:#64748b; }
+.gz-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:8px 0; }
+.gz-panel-h { font-size:11px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:#047857; }
+.gz-panel-t { font-size:17px; font-weight:700; color:#1e293b; margin:2px 0 4px; }
+.gz-sev { display:inline-block; padding:2px 8px; border-radius:6px; font-size:11px; font-weight:700; }
+.gz-sev.h { background:#fee2e2; color:#b91c1c; border:1px solid #fecaca; } .gz-sev.m { background:#fef3c7; color:#b45309; border:1px solid #fde68a; } .gz-sev.l { background:#d1fae5; color:#047857; border:1px solid #a7f3d0; }
+.gz-ai { background:rgba(236,253,245,.7); border:1px solid #a7f3d0; border-radius:12px; padding:11px 13px; margin:8px 0; font-size:12px; color:#475569; }
+.gz-ai .h { display:flex; justify-content:space-between; font-weight:700; color:#064e3b; font-size:12.5px; margin-bottom:5px; }
+.gz-ai .tag { background:rgba(167,243,208,.7); color:#065f46; font-size:10px; padding:1px 6px; border-radius:5px; }
+.gz-ai .row { display:flex; justify-content:space-between; font-size:11.5px; padding-top:3px; }
+.gz-ai .row b { font-family:'JetBrains Mono',monospace; color:#065f46; }
+.gz-box { background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:11px 13px; margin:8px 0; box-shadow:0 1px 2px rgba(0,0,0,.04); }
+.gz-box .h { display:flex; justify-content:space-between; font-weight:700; color:#1e293b; font-size:12.5px; }
+.gz-box .h span { font:500 10px 'JetBrains Mono',monospace; color:#94a3b8; }
+.gz-surv { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; text-align:center; margin:8px 0; }
+.gz-surv div { background:#f8fafc; border:1px solid #f1f5f9; border-radius:8px; padding:6px; }
+.gz-surv .y { font-size:10px; color:#64748b; } .gz-surv .p { font:800 17px 'JetBrains Mono',monospace; color:#059669; } .gz-surv .n { font-size:9px; color:#94a3b8; }
+.gz-risk { display:flex; justify-content:space-between; font-size:11.5px; color:#475569; padding:1px 0; }
+.gz-risk b { font-family:'JetBrains Mono',monospace; font-weight:600; }
+.gz-dark { background:#0f172a; color:#cbd5e1; border-radius:12px; padding:12px 14px; margin:8px 0; font-size:11.5px; }
+.gz-dark .t { display:flex; justify-content:space-between; color:#e2e8f0; font-size:12.5px; margin-bottom:6px; }
+.gz-dark .t b { font-family:'JetBrains Mono',monospace; color:#fbbf24; }
+.gz-dark .r { display:flex; justify-content:space-between; padding:2px 0; } .gz-dark .r span:first-child { color:#94a3b8; } .gz-dark .r span:last-child { font-family:'JetBrains Mono',monospace; }
+.gz-foot { font-size:10.5px; color:#94a3b8; font-style:italic; text-align:center; }
+.gz-pill { background:rgba(15,23,42,.92); color:#fff; font-size:11.5px; border-radius:999px; padding:6px 14px; display:inline-flex; gap:8px; align-items:center; margin-top:6px; }
+.gz-pill .dot { width:8px; height:8px; border-radius:50%; background:#34d399; display:inline-block; }
+.gz-pill b { color:#fcd34d; } .gz-pill .m { color:#94a3b8; }
+.gz-kpi { background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:13px 15px; height:100%; }
+.gz-kpi .l { font-size:10.5px; text-transform:uppercase; letter-spacing:.05em; color:#64748b; font-weight:700; }
+.gz-kpi .v { font:800 22px 'JetBrains Mono',monospace; color:#0f172a; margin:3px 0; }
+.gz-kpi .s { font-size:11px; color:#059669; }
+.gz-scn { border:1px solid #e2e8f0; border-radius:12px; padding:12px 14px; background:#fff; height:100%; font-size:12px; color:#475569; }
+.gz-scn.best { border:2px solid #10b981; background:#f0fdf4; }
+.gz-scn .n { font-weight:700; color:#0f172a; font-size:13px; } .gz-scn .c { font:800 18px 'JetBrains Mono',monospace; color:#0f172a; margin:4px 0; }
+.gz-scn .tag { background:#10b981; color:#fff; font-size:10px; padding:1px 7px; border-radius:5px; font-weight:700; }
+.gz-opt { background:#0f172a; color:#e2e8f0; border-radius:12px; padding:14px 16px; font-size:12px; }
+.gz-opt .h { font-weight:700; font-size:13px; color:#f1f5f9; margin-bottom:8px; }
+.gz-opt .r { display:flex; justify-content:space-between; padding:3px 0; border-bottom:1px solid #1e293b; } .gz-opt .r b { font-family:'JetBrains Mono',monospace; }
+.gz-opt .g { color:#34d399; margin-top:8px; }
+.gz-layers { font-size:12px; font-weight:700; color:#1e293b; margin-bottom:-6px; }
+</style>""", unsafe_allow_html=True)
 
     # ---------- состояние ----------
     if "base" not in ss:
@@ -1705,12 +1968,13 @@ def main():
         ss.decisions = []
         ss.weights = {k: w for k, _, w in FACTORS}
         ss.last_tip = None
-        ss.sel_road = None
         ss.processed_drawings = set()
-        ss.osm_roads = load_cached("osm_roads.json")
+        ss.osm_roads = _server_roads()
         ss.osm_social = load_cached("osm_social.json")
-        ss.page = "🗺️ Карта и зона"
+        ss.page = PAGES[0]
         ss.found_point = None
+        ss.budget = 45_000_000
+        ss.zone_ai = None
 
     def bump():
         ss.data_ver += 1
@@ -1720,61 +1984,99 @@ def main():
             ss.world = World(ss.base, ss.plants_df, ss.rates_df, ss.coeffs_df, ss.osm_roads, ss.osm_social, ss.extra_zones)
         ss.world_ver = ss.data_ver
     W = ss.world
+    C = W.C
     if not W.zone(ss.selected):
         ss.selected = W.zones[0]["id"]
 
     def goto_zone(zid):
         ss.selected = zid
-        ss.page = "🗺️ Карта и зона"
+        ss.page = PAGES[0]
 
-    # ---------- боковая панель ----------
-    PAGES = ["🗺️ Карта и зона", "⚠️ Проблемные зоны", "📊 Приоритеты и бюджет", "🌿 Каталог растений", "📈 Дашборд",
-             "💬 Ассистент", "📥 Загрузка данных", "📚 Справочники", "🕘 История", "❓ Инструкция"]
-    with st.sidebar:
-        st.markdown("### 🌳 AI-ассистент озеленения\n**Павлодар** · MVP")
-        st.radio("Раздел", PAGES, key="page", label_visibility="collapsed")
-        role = st.selectbox("Роль (демо)", ["Специалист", "Администратор", "Просмотр"], key="role",
-                            help="В MVP роль выбирается вручную. Аутентификация и HTTPS — на уровне развёртывания (reverse proxy).")
-        st.divider()
-        st.caption("Быстрый вопрос ассистенту")
-        with st.form("side_chat", clear_on_submit=True):
-            q = st.text_input("Вопрос", placeholder="Что озеленить на 5 млн?", label_visibility="collapsed")
-            if st.form_submit_button("Спросить") and q:
-                ans, zl, tool = assistant_answer(q, W, ss.selected, ss.weights)
-                ss.history.append(dict(t=datetime.datetime.now().strftime("%H:%M:%S"), q=q, a=ans, zones=zl, tool=tool))
-        if ss.history:
-            h = ss.history[-1]
-            st.markdown(f"**Вы:** {h['q']}")
-            st.markdown(h["a"])
-            cols = st.columns(min(4, max(1, len(h["zones"]))))
-            for i, zid in enumerate(h["zones"][:8]):
-                cols[i % len(cols)].button(f"📍{zid}", key=f"sb_{len(ss.history)}_{zid}", on_click=goto_zone, args=(zid,))
-        st.divider()
-        roads_src = "OSM (реальная геометрия)" if W.roads_real else f"{SYN} — загрузите OSM"
-        st.caption(f"Дороги: {roads_src}\n\nСоцобъекты: {'OSM' if W.social_real else SYN}\n\nЗоны/почвы/насаждения: {SYN}")
-
-    st.info(DISCLAIMER, icon="ℹ️")
-    page = ss.page
-    C = W.C
+    def ask(q):
+        ans, zl, tool = assistant_answer(q, W, ss.selected, ss.weights)
+        ss.history.append(dict(t=datetime.datetime.now().strftime("%H:%M:%S"), q=q, a=ans, zones=zl, tool=tool))
+        return ans
 
     def ov_of(zid):
         return ss.ov.setdefault(zid, {"fixed": [], "excluded": [], "replace": {}})
 
+    # ---------- боковая панель: роль + чат ----------
+    with st.sidebar:
+        st.markdown("### 🤖 AI-консультант\nGIS-ассистент отдела благоустройства")
+        role = st.selectbox("Роль (демо)", ["Специалист", "Администратор", "Просмотр"], key="role",
+                            help="В MVP роль выбирается вручную. Аутентификация и HTTPS — на уровне развёртывания.")
+        qc = st.columns(3)
+        for c_, (lab, q_) in zip(qc, [("🚨 Что в первую очередь?", "Какие участки требуют озеленения в первую очередь?"),
+                                      ("💰 План на 35 млн ₸", "Что можно озеленить на 35 млн при максимальном эффекте?"),
+                                      ("🌳 Почему не тополь?", "Почему не тополь для этой зоны?")]):
+            if c_.button(lab, key="q_" + lab, **WIDE):
+                ask(q_)
+        with st.form("side_chat", clear_on_submit=True):
+            q = st.text_input("Вопрос", placeholder="Спросите об участке, растениях, бюджете…", label_visibility="collapsed")
+            if st.form_submit_button("Спросить", **WIDE) and q:
+                ask(q)
+        for i, h in list(enumerate(ss.history))[-3:][::-1]:
+            st.markdown(f"**Вы:** {h['q']}")
+            st.markdown(h["a"])
+            if h["zones"]:
+                cols = st.columns(min(4, len(h["zones"])))
+                for j, zid in enumerate(h["zones"][:8]):
+                    cols[j % len(cols)].button(f"📍{zid}", key=f"sb_{i}_{zid}", on_click=goto_zone, args=(zid,))
+            st.divider()
+        st.caption(f"Дороги на карте: OSM (загружаются в браузере). Аналитика по дорогам: {'OSM' if W.roads_real else SYN}. "
+                   f"Соцобъекты: {'OSM' if W.social_real else SYN}. Зоны/почвы/насаждения: {SYN}.")
+
+    # ---------- шапка ----------
+    n_prob = int((W.problems_df()["Острота"] == "высокая").sum()) if len(W.problems_df()) else 0
+    st.markdown(f"""
+<div class="gz-head">
+  <div style="display:flex;align-items:center;gap:12px">
+    <div class="gz-logo">🌳</div>
+    <div><div class="gz-title">AI-Озеленение Павлодара<span class="gz-badge">MVP 2026.11</span></div>
+    <div class="gz-sub">Акимат г. Павлодар • Отдел благоустройства и озеленения • <b>СК: EPSG:32643 (UTM 43N)</b></div></div>
+  </div>
+  <div class="gz-right">Лимит бюджета благоустройства:<br><span class="v">{fmt_tg(ss.budget)}</span>
+    <span class="gz-role">👤 {role}</span> <span class="gz-role" style="color:#fca5a5">⚠ {n_prob} критич. проблем</span></div>
+</div>""", unsafe_allow_html=True)
+    st.radio("Раздел", PAGES, key="page", horizontal=True, label_visibility="collapsed")
+    st.caption(DISCLAIMER)
+    page = ss.page
+
     # ---------- карта ----------
+    class OsmRoads(MacroElement):
+        def __init__(self, labels=True):
+            super().__init__()
+            self._name = "OsmRoads"
+            self.labels = labels
+            self._template = Template("{% macro script(this, kwargs) %}" + ROADS_JS.replace("%MAP%", "{{ this._parent.get_name() }}")
+                                      .replace("%LABELS%", "true" if labels else "false") + "{% endmacro %}")
+
+    BASEMAPS = {
+        "Voyager (OSM) + подписи поверх дорог": ("https://{s}.basemaps.cartocdn.com/rastertiles/voyager_nolabels/{z}/{x}/{y}{r}.png", "&copy; OpenStreetMap contributors &copy; CARTO", True),
+        "OpenStreetMap (стандарт)": ("OpenStreetMap", None, False),
+        "Светлая (Carto Positron)": ("https://{s}.basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}{r}.png", "&copy; OpenStreetMap contributors &copy; CARTO", True),
+        "2ГИС (растровые тайлы)": ("https://tile2.maps.2gis.com/tiles?x={x}&y={y}&z={z}&v=1", "© 2ГИС (проверьте условия использования)", False),
+    }
+
     def build_map(layers, basemap, center=None, zoom=13, plan=None):
-        if basemap.startswith("2ГИС"):
-            m = folium.Map(location=center or CENTER, zoom_start=zoom, tiles="https://tile2.maps.2gis.com/tiles?x={x}&y={y}&z={z}&v=1",
-                           attr="© 2ГИС (растровые тайлы; проверьте условия использования)", max_zoom=18)
-        elif basemap.startswith("Светлая"):
-            m = folium.Map(location=center or CENTER, zoom_start=zoom, tiles="CartoDB positron")
+        url, attr, labels = BASEMAPS.get(basemap, list(BASEMAPS.values())[0])
+        if attr:
+            m = folium.Map(location=center or CENTER, zoom_start=zoom, tiles=url, attr=attr, max_zoom=19)
         else:
-            m = folium.Map(location=center or CENTER, zoom_start=zoom, tiles="OpenStreetMap")
+            m = folium.Map(location=center or CENTER, zoom_start=zoom, tiles=url, max_zoom=19)
+        m.get_root().header.add_child(Element("""<style>
+.gz-road-label{background:rgba(15,23,42,.8);border:none;color:#fff;font:600 10px Inter,Arial,sans-serif;padding:1px 5px;border-radius:3px;box-shadow:0 1px 3px rgba(0,0,0,.3)}
+.gz-road-label:before{display:none}
+.gz-pulse{width:14px;height:14px;border-radius:50%;background:#dc2626;border:2px solid #fff;animation:gzp 1.8s cubic-bezier(.215,.61,.355,1) infinite}
+@keyframes gzp{0%{transform:scale(.85);box-shadow:0 0 0 0 rgba(239,68,68,.7)}70%{transform:scale(1.1);box-shadow:0 0 0 12px rgba(239,68,68,0)}100%{transform:scale(.85);box-shadow:0 0 0 0 rgba(239,68,68,0)}}
+.gz-poi{width:24px;height:24px;border-radius:50%;background:#fff;border:1px solid #cbd5e1;box-shadow:0 1px 3px rgba(0,0,0,.25);display:flex;align-items:center;justify-content:center;font-size:13px}
+</style>"""))
         pr = W.priorities(ss.weights)
         prd = dict(zip(pr.id, pr.priority))
         if "Почвы" in layers:
             g = folium.FeatureGroup(name="Почвы")
             for s in W.soils:
-                folium.GeoJson(ring_to_geojson(s["ring"]), style_function=lambda f, c=SOIL_TYPES[s["soil_type"]]["color"]: dict(fillColor=c, color=c, weight=0.5, fillOpacity=0.28),
+                folium.GeoJson(ring_to_geojson(s["ring"]), style_function=lambda f, c=SOIL_TYPES[s["soil_type"]]["color"]: dict(fillColor=c, color=c, weight=0.5, fillOpacity=0.25),
                                tooltip=f"Почва: {s['soil_type']}, pH {s['ph']}, засоление {s['salinity']} дСм/м, плодородие {s['fertility']}/5, влажность {s['moisture']}/5 ({s['src']})").add_to(g)
             g.add_to(m)
         if "Существующая зелень" in layers:
@@ -1784,56 +2086,35 @@ def main():
                 folium.Circle([o["lat"], o["lon"]], radius=o["r"] * 3, color=cc[o["condition"]], fill=True, fill_opacity=0.6, weight=1,
                               tooltip=f"{o['species']}, {o['condition']}, {o['age']} лет ({o['src']})").add_to(g)
             g.add_to(m)
-        if "Дороги" in layers:
-            g = folium.FeatureGroup(name="Дороги (вектор, аналитика)")
-            sel_xy = ring_xy(W.zone(ss.selected)["ring"])
-            feats = []
-            for r, xy, bb in zip(W.roads, W.rindex.xy, W.rindex.bb):
-                major = r["highway"] in MAJOR_ROADS
-                if not major and bbox_gap(bbox_of(sel_xy), bb) > 900:
-                    continue  # мелкие дороги — только у выбранной зоны (быстрая загрузка)
-                cr = ROAD_CLASSES.get(r["highway"], ("прочая", 0.2, 1.5, "#ddd", 0))
-                order = cr[4] + (20 if r.get("bridge") else 0) - (20 if r.get("tunnel") else 0)
-                feats.append(dict(type="Feature", geometry=dict(type="LineString", coordinates=[[a, b] for a, b in r["line"]]),
-                                  properties=dict(rid=r["rid"], name=r["name"], cls=r["highway"], cls_ru=cr[0], len_m=int(r.get("len_m", 0)),
-                                                  oneway="да" if r.get("oneway") == "yes" else "нет", w=cr[2], col=cr[3], order=order,
-                                                  tunnel=bool(r.get("tunnel")))))
-            feats.sort(key=lambda f: f["properties"]["order"])  # тоннели снизу, мосты сверху
-            fc = dict(type="FeatureCollection", features=feats)
-            folium.GeoJson(fc, style_function=lambda f: dict(color="#6b6b6b", weight=f["properties"]["w"] + 2, opacity=0.35 if f["properties"]["tunnel"] else 0.9)).add_to(g)
-            folium.GeoJson(fc, style_function=lambda f: dict(color=f["properties"]["col"], weight=f["properties"]["w"],
-                                                             opacity=0.4 if f["properties"]["tunnel"] else 1, dashArray="4 4" if f["properties"]["tunnel"] else None),
-                           highlight_function=lambda f: dict(color="#0066ff", weight=f["properties"]["w"] + 2),
-                           tooltip=folium.GeoJsonTooltip(fields=["rid", "name", "cls_ru", "len_m", "oneway"],
-                                                         aliases=["Дорога", "Название", "Класс", "Длина, м", "Одностор."])).add_to(g)
-            g.add_to(m)
         zg = folium.FeatureGroup(name="Зоны озеленения")
         for z in W.zones:
+            sev = max([SEV_ORDER[p["Острота"]] for p in z["problems"]] or [0])
             if "Приоритеты" in layers:
                 v = prd.get(z["id"], 0)
-                col = "#b71c1c" if v >= 60 else ("#ef6c00" if v >= 45 else ("#fbc02d" if v >= 30 else "#2e7d32"))
+                col = "#b91c1c" if v >= 60 else ("#ea580c" if v >= 45 else ("#f59e0b" if v >= 30 else "#10b981"))
             else:
-                col = PURPOSE_COLOR.get(z["purpose"], "#2e7d32")
+                col = {3: "#ef4444", 2: "#f59e0b"}.get(sev, "#10b981")
             sel = z["id"] == ss.selected
             folium.GeoJson(ring_to_geojson(z["ring"]),
-                           style_function=lambda f, c=col, s=sel: dict(fillColor=c, color="#00e5ff" if s else c, weight=5 if s else 2, fillOpacity=0.45),
-                           tooltip=f"{z['id']} · {z['purpose']} · {z['district']} · приоритет {prd.get(z['id'], 0)}").add_to(zg)
+                           style_function=lambda f, c=col, s=sel: dict(fillColor=c, color=c, weight=3.5 if s else 2, dashArray=None if s else "3, 5",
+                                                                       fillOpacity=0.45 if s else 0.25),
+                           tooltip=f"{z['id']} · {z['name']} · приоритет {prd.get(z['id'], 0):.0f} · зелень {z['green_share']:.0%}").add_to(zg)
+            if "Проблемные зоны" in layers and sev == 3:
+                folium.Marker([z["lat"], z["lon"]], icon=folium.DivIcon(html='<div class="gz-pulse"></div>', icon_size=(14, 14), icon_anchor=(7, 7)),
+                              tooltip=f"{z['id']} — критично: " + "; ".join(p["Проблема"] for p in z["problems"] if p["Острота"] == "высокая")).add_to(zg)
+            elif "Проблемные зоны" in layers and sev == 2:
+                folium.CircleMarker([z["lat"], z["lon"]], radius=5, color="#fff", weight=2, fill=True, fill_color="#f59e0b", fill_opacity=1,
+                                    tooltip=f"{z['id']} — " + "; ".join(p["Проблема"] for p in z["problems"])).add_to(zg)
         zg.add_to(m)
-        if "Проблемные зоны" in layers:
-            g = folium.FeatureGroup(name="Проблемные зоны")
-            for z in W.zones:
-                if not z["problems"]:
-                    continue
-                sev = max(SEV_ORDER[p["Острота"]] for p in z["problems"])
-                col = {3: "red", 2: "orange", 1: "beige"}[sev]
-                folium.Marker([z["lat"], z["lon"]], icon=folium.Icon(color=col, icon="exclamation-sign"),
-                              tooltip=f"{z['id']} — проблем: {len(z['problems'])}: " + "; ".join(p["Проблема"] for p in z["problems"])).add_to(g)
-            g.add_to(m)
-        if "Социальные объекты" in layers:
-            g = folium.FeatureGroup(name="Социальные объекты")
+        if "Школы и больницы" in layers:
+            g = folium.FeatureGroup(name="Школы и больницы")
+            ico = {"school": "🎓", "kindergarten": "🧸", "hospital": "🏥", "clinic": "🏥", "residential": "🏢"}
             for s in W.social:
-                folium.CircleMarker([s["lat"], s["lon"]], radius=4, color="#1565c0", fill=True,
-                                    tooltip=f"{SOCIAL_RU.get(s['kind'], s['kind'])}: {s['name']} ({s['src']})").add_to(g)
+                if s["kind"] in ("school", "kindergarten", "hospital", "clinic"):
+                    folium.Circle([s["lat"], s["lon"]], radius=150, color="#3b82f6", weight=1, dash_array="4, 4", fill=True,
+                                  fill_color="#60a5fa", fill_opacity=0.12).add_to(g)
+                folium.Marker([s["lat"], s["lon"]], icon=folium.DivIcon(html=f'<div class="gz-poi">{ico.get(s["kind"], "📍")}</div>', icon_size=(24, 24), icon_anchor=(12, 12)),
+                              tooltip=f"{s['name']} ({SOCIAL_RU.get(s['kind'], s['kind'])}) · буфер 150 м: без аллергенов и ядовитых видов · {s['src']}").add_to(g)
             g.add_to(m)
         if "Предлагаемые посадки" in layers and plan:
             g = folium.FeatureGroup(name="Предлагаемые посадки")
@@ -1841,28 +2122,31 @@ def main():
             woody = [l for l in plan["lines"] if l["type"] != "газон"]
             n = sum(l["qty"] for l in woody)
             k = min(1.0, 250 / n) if n else 0
-            pts = sample_points_in(z["ring"], int(sum(round(l["qty"] * k) for l in woody)), seed=hash(z["id"]) % 1000)
+            pts = sample_points_in(z["ring"], int(sum(round(l["qty"] * k) for l in woody)), seed=sum(map(ord, z["id"])))
             i = 0
             for l in woody:
                 for _ in range(int(round(l["qty"] * k))):
                     if i >= len(pts):
                         break
                     lo, la = pts[i]; i += 1
-                    folium.CircleMarker([la, lo], radius=4 if l["type"] == "дерево" else 2.5, color="#1b5e20" if l["type"] == "дерево" else "#7cb342",
+                    folium.CircleMarker([la, lo], radius=4 if l["type"] == "дерево" else 2.5, color="#14532d" if l["type"] == "дерево" else "#65a30d",
                                         fill=True, fill_opacity=0.9, weight=1, tooltip=f"{l['name']} (план)").add_to(g)
             g.add_to(m)
         if ss.found_point:
             lo, la, lab = ss.found_point
             folium.Marker([la, lo], tooltip=f"Найдено: {lab}", icon=folium.Icon(color="blue", icon="search")).add_to(m)
+        if "Граф дорог (OSM)" in layers:
+            m.add_child(OsmRoads(labels=labels))
+        elif labels:
+            folium.TileLayer(url.replace("_nolabels", "_only_labels"), attr=attr, overlay=True, name="Подписи").add_to(m)
         Draw(export=False, draw_options=dict(polyline=False, circle=False, marker=False, circlemarker=False, rectangle=True, polygon=True),
              edit_options=dict(edit=False, remove=True)).add_to(m)
-        folium.LayerControl(collapsed=True).add_to(m)
         return m
 
-    def show_map(m, key, height=600):
+    def show_map(m, key, height=620):
         if st_folium is None:
             components.html(m.get_root().render(), height=height)
-            st.warning("Пакет streamlit-folium не установлен: клик по карте и рисование недоступны (pip install streamlit-folium).")
+            st.warning("Пакет streamlit-folium не установлен: клик по карте и рисование недоступны.")
             return {}
         try:
             return st_folium(m, height=height, use_container_width=True, key=key,
@@ -1875,14 +2159,12 @@ def main():
         if tip and tip != ss.last_tip:
             ss.last_tip = tip
             mz = re.search(r"Z-\d+", tip)
-            mr = re.search(r"R-\d+", tip)
             if mz and W.zone(mz.group(0)) and mz.group(0) != ss.selected:
                 ss.selected = mz.group(0)
+                ss.zone_ai = None
                 st.rerun()
-            elif mr:
-                ss.sel_road = mr.group(0)
         drw = (out or {}).get("last_active_drawing")
-        if drw and drw.get("geometry", {}).get("type") == "Polygon":
+        if drw and (drw.get("geometry") or {}).get("type") == "Polygon":
             h = json.dumps(drw["geometry"], sort_keys=True)
             if h not in ss.processed_drawings:
                 ring = [tuple(p[:2]) for p in drw["geometry"]["coordinates"][0]][:-1]
@@ -1901,20 +2183,103 @@ def main():
                     bump()
                     st.rerun()
 
+    def zone_inspector(z, plan, variant):
+        """Паспорт выбранного участка — по образцу HTML-макета."""
+        sev = max([SEV_ORDER[p["Острота"]] for p in z["problems"]] or [0])
+        badge = {3: ('h', 'Критический (срочно)'), 2: ('m', 'Средний дефицит'), 1: ('l', 'Низкий'), 0: ('l', 'Без проблем')}[sev]
+        deficit = z["green_share"] - 0.25
+        pol = "высокое" if z["road_exposure"] > 0.6 else ("среднее" if z["road_exposure"] > 0.3 else "низкое")
+        polc = "#dc2626" if pol == "высокое" else ("#d97706" if pol == "среднее" else "#059669")
+        st.markdown(f"""
+<div class="gz-panel-h">🎯 Паспорт выбранного участка</div>
+<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px"><div class="gz-panel-t">{z['id']} · {z['name']}</div>
+<span class="gz-sev {badge[0]}">{badge[1]}</span></div>
+<div class="gz-grid">
+ <div class="gz-card"><div class="l">Площадь (EPSG:32643)</div><div class="v">{fmt_tg(z['area_m2'])[:-2]} м²</div><div class="s">Посадочная: <b>{fmt_tg(plan['plantable_m2'])[:-2]} м²</b></div></div>
+ <div class="gz-card"><div class="l">Текущая зелень / дефицит</div><div class="v" style="color:{'#dc2626' if deficit < 0 else '#059669'}">{z['green_share']:.0%}
+   <span style="font-size:11px;color:#94a3b8">({deficit * 100:+.0f} п.п. к ориентиру)</span></div><div class="s">Ориентир: 25% · {z['district']} район</div></div>
+ <div class="gz-card"><div class="l">Почвенный профиль</div><div style="font-weight:700;font-size:12.5px;color:#78350f">{z['soil_type']}</div>
+   <div class="s">pH: <b>{z['ph']}</b> ({'щелочн.' if z['ph'] > 7.5 else 'нейтр.'}) · соль: <b style="color:{'#dc2626' if z['salinity'] > 4 else '#334155'}">{z['salinity']} дСм/м</b></div></div>
+ <div class="gz-card"><div class="l">Транспортная нагрузка</div><div style="font-weight:700;font-size:12.5px;color:#1e293b">{z['road_class_ru'].capitalize()}, {z['dist_road']:.0f} м</div>
+   <div class="s" style="color:{polc};font-weight:600">{z['road_name'][:38]} · загрязнение: {pol}</div></div>
+</div>""", unsafe_allow_html=True)
+        woody = [l for l in plan["lines"] if l["type"] != "газон"]
+        if plan["lines"]:
+            avg_sc = round(sum(l["score"] * l["qty"] for l in woody) / max(1, sum(l["qty"] for l in woody))) if woody else plan["lines"][0]["score"]
+            tiers = {"дерево": "1-й ярус", "кустарник": "2-й ярус", "газон": "травы"}
+            top = sorted(woody, key=lambda l: -l["score"])[:2]
+            why = "; ".join(w[2:] for w in (top[0]["why"] if top else []) if w.startswith("+"))[:180]
+            rows = "".join(f'<div class="row"><span>{i + 1}. {l["name"]}</span><b>{l["qty"]:,} {l["unit"]} ({tiers[l["type"]]})</b></div>'.replace(",", " ")
+                           for i, l in enumerate(plan["lines"][:6]))
+            st.markdown(f"""<div class="gz-ai"><div class="h"><span>✨ AI-рекомендация по породам · «{variant}»</span><span class="tag">Пригодность: {avg_sc}/100</span></div>
+Для почвы «{z['soil_type']}» (pH {z['ph']}, засоление {z['salinity']}) и назначения «{z['purpose']}» подобрана {len(set(l['type'] for l in plan['lines']))}-ярусная посадка.
+{('Ведущий вид — ' + top[0]['name'] + (': ' + why if why else '') + '.') if top else ''}
+<div style="margin-top:8px;padding-top:6px;border-top:1px solid #a7f3d0">{rows}</div></div>""", unsafe_allow_html=True)
+        a = plan["avg_surv"]
+        if a["p1"] is not None:
+            agg = {}
+            q = sum(l["qty"] for l in woody)
+            for l in woody:
+                for k_, v_ in l["surv"]["contrib"].items():
+                    agg[k_] = agg.get(k_, 0) + v_ * l["qty"] / q
+            risks = sorted([(k_, v_) for k_, v_ in agg.items() if v_ < -0.5], key=lambda t: t[1])[:3]
+            M = train_survival_model()
+            col_ = lambda p: "#059669" if p >= 0.75 else ("#d97706" if p >= 0.6 else "#dc2626")
+            rk = "".join(f'<div class="gz-risk"><span>➖ {FEAT_RU[k_]}</span><b style="color:#dc2626">{v_:+.1f} п.п.</b></div>' for k_, v_ in risks) or \
+                '<div class="gz-risk"><span>Существенных факторов риска нет</span><b></b></div>'
+            zi = dict(z); zi.update(salinity=round(z["salinity"] * 0.6, 1), fertility=min(5, z["fertility"] + 1))
+            V = plan["V"]
+            imp = sum(predict_survival(l["plant"], zi, V["watering"], V["age"], V["care_years"])["p3"] * l["qty"] for l in woody) / q - a["p3"]
+            if imp > 0.005:
+                rk += f'<div class="gz-risk"><span>➕ Мелиорация почвы (гипс, грунт, удобрения)</span><b style="color:#059669">{imp * 100:+.1f} п.п.</b></div>'
+            st.markdown(f"""<div class="gz-box"><div class="h">❤️ Прогноз приживаемости (правила + ML)<span>ROC-AUC {M['auc']} · синт.</span></div>
+<div class="gz-surv"><div><div class="y">1-й год</div><div class="p" style="color:{col_(a['p1'])}">{a['p1']:.0%}</div><div class="n">Критический период</div></div>
+<div><div class="y">2-й год</div><div class="p" style="color:{col_(a['p2'])}">{a['p2']:.0%}</div><div class="n">Укоренение</div></div>
+<div><div class="y">3-й год</div><div class="p" style="color:{col_(a['p3'])}">{a['p3']:.0%}</div><div class="n">Стабильный фонд</div></div></div>{rk}</div>""",
+                        unsafe_allow_html=True)
+        est = plan["estimate"]["table"].set_index("Статья")["Сумма, ₸"]
+        g1 = est.get("Посадочный материал", 0)
+        g2 = sum(est.get(k_, 0) for k_ in ["Подготовка территории и грунт", "Удобрения", "Мелиорация засолённой почвы", "Дренаж"])
+        g3 = sum(v_ for k_, v_ in est.items() if k_ in ("Посадка", "Доставка") or k_.startswith("Полив"))
+        g4 = est.get("Резерв на замену неприжившихся", 0)
+        st.markdown(f"""<div class="gz-dark"><div class="t"><span>Смета (сценарий «{variant}»):</span><b>{fmt_tg(plan['estimate']['total'])}</b></div>
+<div class="r"><span>Посадочный материал:</span><span>{fmt_tg(g1)}</span></div>
+<div class="r"><span>Подготовка грунта, мелиорация, дренаж:</span><span>{fmt_tg(g2)}</span></div>
+<div class="r"><span>Посадка, доставка, полив и уход ({plan['V']['care_years']} г.):</span><span>{fmt_tg(g3)}</span></div>
+<div class="r"><span>Резерв на замену неприжившихся:</span><span>{fmt_tg(g4)}</span></div></div>""", unsafe_allow_html=True)
+        b1, b2, b3 = st.columns([1.3, 1, 1])
+        if b1.button("✅ Утвердить в план", type="primary", disabled=role == "Просмотр", **WIDE):
+            ss.decisions.append(dict(t=datetime.datetime.now().strftime("%d.%m %H:%M"), zone=z["id"], variant=variant,
+                                     cost=round(plan["estimate"]["total"]), trees=sum(l["qty"] for l in plan["lines"] if l["type"] == "дерево"),
+                                     surv3=round(plan["avg_surv"]["p3"] or 0, 3), co2_20=round(plan["eco"]["co2_cum20_t"], 1),
+                                     ov=json.dumps(ov_of(z["id"]), ensure_ascii=False)))
+            st.toast(f"Участок {z['id']} включён в предварительный план (см. «История»)") if hasattr(st, "toast") else st.success("Сохранено")
+        if b2.button("💬 AI-анализ", **WIDE):
+            ss.zone_ai = (z["id"], ask(f"Экспресс-аудит зоны {z['id']}"))
+        b3.download_button("📄 Паспорт", make_passport_html(W, z["id"], plan), f"pasport_{z['id']}.html", mime="text/html", **WIDE)
+        if ss.get("zone_ai") and ss.zone_ai[0] == z["id"]:
+            st.info(ss.zone_ai[1])
+        st.markdown('<div class="gz-foot">* Оценочный расчёт. Решение принимает специалист отдела благоустройства. Расценки и коэффициенты — «Справочники».</div>',
+                    unsafe_allow_html=True)
+
     # ===================== СТРАНИЦЫ =====================
-    if page == "🗺️ Карта и зона":
+    if page == PAGES[0]:
         z = W.zone(ss.selected)
-        t1, t2, t3, t4 = st.columns([2.2, 1.6, 1.6, 2])
-        layers = t1.multiselect("Слои", ["Почвы", "Существующая зелень", "Проблемные зоны", "Приоритеты", "Предлагаемые посадки", "Дороги", "Социальные объекты"],
-                                default=["Проблемные зоны", "Предлагаемые посадки", "Дороги"], key="layers")
-        basemap = t2.selectbox("Подложка", ["OpenStreetMap", "Светлая (Carto)", "2ГИС (растровые тайлы)"] + (["2ГИС MapGL (ключ)"] if os.getenv("DGIS_API_KEY") else []), key="basemap")
+        st.markdown('<div class="gz-layers">🗂️ Слои Павлодара</div>', unsafe_allow_html=True)
+        LAYERS = ["Граф дорог (OSM)", "Проблемные зоны", "Предлагаемые посадки", "Школы и больницы", "Почвы", "Существующая зелень", "Приоритеты"]
+        lc = st.columns(len(LAYERS))
+        layers = [nm for c_, nm in zip(lc, LAYERS) if c_.checkbox(nm, value=nm in LAYERS[:4], key=f"lay_{nm}")]
+        t2, t3, t4 = st.columns([1.6, 1.2, 2])
+        basemap = t2.selectbox("Подложка", list(BASEMAPS) + (["2ГИС MapGL (ключ)"] if os.getenv("DGIS_API_KEY") else []), key="basemap")
         ids = [zz["id"] for zz in W.zones]
         ss.zone_pick = ss.selected
-        t3.selectbox("Зона", ids, key="zone_pick", on_change=lambda: ss.__setitem__("selected", ss.zone_pick))
+        t3.selectbox("Участок", ids, key="zone_pick", format_func=lambda i: f"{i} · {W.zone(i)['purpose']}",
+                     on_change=lambda: ss.__setitem__("selected", ss.zone_pick))
         with t4.form("addr", clear_on_submit=False):
             a1, a2 = st.columns([3, 1])
-            addr = a1.text_input("Поиск адреса", placeholder="ул. Толстого 99", label_visibility="collapsed")
-            if a2.form_submit_button("🔎") and addr:
+            addr = a1.text_input("Поиск адреса", placeholder="Адрес в Павлодаре, напр. ул. Сатпаева 50")
+            a2.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            if a2.form_submit_button("🔎 Найти") and addr:
                 try:
                     res = geocode(addr)
                     if res:
@@ -1923,11 +2288,9 @@ def main():
                         ins = [zz for zz in W.zones if pip(lo, la, zz["ring"])]
                         if ins:
                             ss.selected = ins[0]["id"]
-                            st.success(f"Адрес внутри зоны {ins[0]['id']}")
                         else:
                             zz = W.new_zone_from_ring(_circle_ring(lo, la, 40), {"name": lab[:40]}, src=f"адрес «{addr}»")
                             ss.extra_zones.append(zz); ss.selected = zz["id"]; bump()
-                            st.success(f"Создана зона {zz['id']} (круг 40 м) вокруг адреса")
                         st.rerun()
                     else:
                         st.warning("Адрес не найден")
@@ -1939,198 +2302,161 @@ def main():
         for _k, _wk in (("excluded", f"ex_{z['id']}"), ("fixed", f"fx_{z['id']}")):
             if _wk in ss:
                 _o[_k] = list(ss[_wk])
-        plan = W.plan(z["id"], variant, ov_of(z["id"]), ss.get("care_years"), None)
+        plan = W.plan(z["id"], variant, _o, ss.get("care_years"), None)
 
-        cmap, cpanel = st.columns([1.35, 1])
+        cmap, cpanel = st.columns([1.55, 1])
         with cmap:
             if basemap == "2ГИС MapGL (ключ)":
                 key = os.getenv("DGIS_API_KEY")
                 data = [dict(id=zz["id"], coords=[[[a, b] for a, b in zz["ring"]] + [[zz["ring"][0][0], zz["ring"][0][1]]]],
                              col=PURPOSE_COLOR.get(zz["purpose"], "#2e7d32")) for zz in W.zones]
-                html = f"""<div id="c" style="width:100%;height:600px"></div>
+                components.html(f"""<div id="c" style="width:100%;height:620px"></div>
 <script src="https://mapgl.2gis.com/api/js/v1"></script>
 <script>
 const map = new mapgl.Map('c', {{center:[{z['lon']},{z['lat']}], zoom:14, key:'{key}'}});
-const Z = {json.dumps(data)};
-Z.forEach(z => new mapgl.Polygon(map, {{coordinates: z.coords, color: z.col + '66', strokeColor: z.col, strokeWidth: 2}}));
-</script>"""
-                components.html(html, height=610)
-                st.caption("2ГИС MapGL: просмотр. Выбор зоны и рисование — на подложке OSM.")
+{json.dumps(data)}.forEach(z => new mapgl.Polygon(map, {{coordinates: z.coords, color: z.col + '66', strokeColor: z.col, strokeWidth: 2}}));
+</script>""", height=630)
+                st.caption("2ГИС MapGL: дороги и подписи — из 2ГИС. Выбор зоны и рисование — на подложке OSM.")
             else:
                 m = build_map(layers, basemap, center=(z["lat"], z["lon"]), zoom=15, plan=plan)
-                out = show_map(m, key=f"map_{ss.selected}_{ss.data_ver}")
-                handle_map_output(out)
-            st.caption("Клик по зоне — выбор; инструменты слева — нарисовать новый полигон; слои — в правом верхнем углу карты. "
-                       + ("Дороги: OSM, реальная геометрия." if W.roads_real else "⚠ Векторные дороги — синтетика; реальные дороги видны на подложке. Загрузите OSM в «Загрузка данных»."))
-            if ss.sel_road:
-                r = next((rr for rr in W.roads if rr["rid"] == ss.sel_road), None)
-                if r:
-                    n_tr = int(r.get("len_m", 0) * 2 / 8)
-                    cost = n_tr * (16000 + C["rates"]["plant_tree"]) + r.get("len_m", 0) * 2 * (3500 + C["rates"]["plant_shrub"])
-                    st.info(f"🛣️ **{r['name']}** ({ROAD_CLASSES.get(r['highway'], (r['highway'],))[0]}), длина {r.get('len_m', 0):,.0f} м. "
-                            f"Озеленение вдоль дороги (2 стороны, деревья через 8 м + живая изгородь): ≈ {n_tr} деревьев, ≈ {fmt_tg(cost)} (оценка).".replace(",", " "))
+                handle_map_output(show_map(m, key=f"map_{ss.selected}_{ss.data_ver}_{basemap[:4]}"))
+            near_road = [zz for zz in W.zones if zz["dist_road"] < 60 and zz["green_share"] < 0.15]
+            st.markdown(f"""<div class="gz-pill"><span class="dot"></span><span>Защитные полосы: <b>{len(near_road)} из {len(W.zones)}</b> участков у дорог (&lt;60 м) с зеленью &lt;15%</span>
+<span class="m">|</span><span class="m">Дороги: © OpenStreetMap · аналитика: {'OSM' if W.roads_real else 'синтетика'} · участки: синтетика</span></div>""", unsafe_allow_html=True)
+            st.caption("Клик по участку — выбор; по улице — название, класс, длина и расчёт защитной полосы. Инструменты слева на карте — нарисовать новый участок.")
 
         with cpanel:
-            st.subheader(f"{z['id']} · {z['name']}")
-            st.caption(f"Источник данных: {z.get('src', '')}")
             vcol, ycol = st.columns(2)
-            vcol.selectbox("Вариант", list(VARIANTS), index=list(VARIANTS).index(variant), key="variant")
-            ycol.selectbox("Уход, лет", [None, 1, 2, 3], format_func=lambda v: "по варианту" if v is None else str(v), key="care_years")
+            vcol.selectbox("Сценарий", list(VARIANTS), index=list(VARIANTS).index(variant), key="variant")
+            ycol.selectbox("Уход, лет", [None, 1, 2, 3], format_func=lambda v: "по сценарию" if v is None else str(v), key="care_years")
             for w in plan["warnings"]:
                 st.warning(w)
-            tabs = st.tabs(["Обзор", "Растения", "Смета", "Приживаемость и уход", "Эффект", "Вдоль дороги", "Отчёт"])
-            with tabs[0]:
-                a, b, c = st.columns(3)
-                a.metric("Площадь", f"{z['area_m2']:,.0f} м²".replace(",", " "))
-                b.metric("Доля зелени", f"{z['green_share']:.0%}")
-                pr = W.priorities(ss.weights)
-                c.metric("Приоритет", f"{pr.set_index('id').loc[z['id'], 'priority']:.0f}/100")
-                st.markdown(f"""
-- **Назначение:** {z['purpose']} · **Район:** {z['district']}
+            zone_inspector(z, plan, variant)
+
+        st.markdown("#### Подробно по участку")
+        tabs = st.tabs(["Обзор", "Растения", "Смета", "Приживаемость и уход", "Эффект", "Вдоль дороги", "Отчёты"])
+        with tabs[0]:
+            st.markdown(f"""
+- **Назначение:** {z['purpose']} · **Район:** {z['district']} · **Источник данных:** {z.get('src', '')}
 - **Почва:** {z['soil_type']}, pH {z['ph']}, засоление {z['salinity']} дСм/м, плодородие {z['fertility']}/5, влажность {z['moisture']}/5
-- **Ближайшая дорога:** {z['road_name']} — {z['road_class_ru']}, {z['dist_road']:.0f} м; нагрузка от дорог {z['road_exposure']:.2f}
+- **Ближайшая дорога:** {z['road_name']} — {z['road_class_ru']}, {z['dist_road']:.0f} м; нагрузка от дорог {z['road_exposure']:.2f} ({'OSM' if W.roads_real else SYN})
 - **Соцобъекты в 500 м:** {z['social_n']} ({z['social_list']})
 - **Микроклимат:** t° поверхности {z['lst']} °C, затенение {z['shade']}/5, ветер {z['wind']}/5 ({SYN})
 - **До зданий:** {z['bldg_dist']} м · **Население:** {z['pop_density']} чел/га ({SYN})""")
-                if z["problems"]:
-                    st.markdown("**Проблемы:**")
-                    st.dataframe(pd.DataFrame(z["problems"]).drop(columns="zone"), hide_index=True, **WIDE)
-                if role != "Просмотр" and st.button("💾 Сохранить решение по зоне"):
-                    ss.decisions.append(dict(t=datetime.datetime.now().strftime("%d.%m %H:%M"), zone=z["id"], variant=variant,
-                                             cost=round(plan["estimate"]["total"]), trees=sum(l["qty"] for l in plan["lines"] if l["type"] == "дерево"),
-                                             surv3=round(plan["avg_surv"]["p3"] or 0, 3), co2_20=round(plan["eco"]["co2_cum20_t"], 1),
-                                             ov=json.dumps(ov_of(z["id"]), ensure_ascii=False)))
-                    st.success("Решение сохранено в «Историю»")
-            with tabs[1]:
-                sel, surv_t, eco_t = plan_tables(plan)
-                st.dataframe(sel, hide_index=True, **WIDE,
-                             column_config={"Пригодность": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d")})
-                o = ov_of(z["id"])
-                names = [p["name"] for p in C["plants"]]
-                o["excluded"] = st.multiselect("Исключить виды", names, default=[x for x in o["excluded"] if x in names], key=f"ex_{z['id']}")
-                o["fixed"] = st.multiselect("Зафиксировать виды (всегда в плане)", names, default=[x for x in o["fixed"] if x in names], key=f"fx_{z['id']}")
-                r1, r2, r3 = st.columns([2, 2, 1])
-                frm = r1.selectbox("Заменить", ["—"] + [l["name"] for l in plan["lines"]], key=f"rf_{z['id']}")
-                to = r2.selectbox("на", ["—"] + names, key=f"rt_{z['id']}")
-                if r3.button("↔", key=f"rb_{z['id']}") and frm != "—" and to != "—" and frm != to:
-                    o["replace"][frm] = to
+            if z["problems"]:
+                st.dataframe(pd.DataFrame(z["problems"]).drop(columns="zone"), hide_index=True, **WIDE)
+        with tabs[1]:
+            sel, surv_t, eco_t = plan_tables(plan)
+            st.dataframe(sel, hide_index=True, **WIDE,
+                         column_config={"Пригодность": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d")})
+            o = ov_of(z["id"])
+            names = [p["name"] for p in C["plants"]]
+            o["excluded"] = st.multiselect("Исключить виды", names, default=[x for x in o["excluded"] if x in names], key=f"ex_{z['id']}")
+            o["fixed"] = st.multiselect("Зафиксировать виды (всегда в плане)", names, default=[x for x in o["fixed"] if x in names], key=f"fx_{z['id']}")
+            r1, r2, r3 = st.columns([2, 2, 1])
+            frm = r1.selectbox("Заменить", ["—"] + [l["name"] for l in plan["lines"]], key=f"rf_{z['id']}")
+            to = r2.selectbox("на", ["—"] + names, key=f"rt_{z['id']}")
+            if r3.button("↔", key=f"rb_{z['id']}") and frm != "—" and to != "—" and frm != to:
+                o["replace"][frm] = to
+                st.rerun()
+            if o["replace"]:
+                st.caption("Замены: " + "; ".join(f"{a} → {b}" for a, b in o["replace"].items()))
+                if st.button("Сбросить замены"):
+                    o["replace"] = {}
                     st.rerun()
-                if o["replace"]:
-                    st.caption("Замены: " + "; ".join(f"{a} → {b}" for a, b in o["replace"].items()))
-                    if st.button("Сбросить замены"):
-                        o["replace"] = {}
-                        st.rerun()
-                with st.expander(f"Исключено ограничениями: {len(plan['rejected'])}"):
-                    st.dataframe(pd.DataFrame(plan["rejected"]), hide_index=True, **WIDE)
-                st.markdown("**Сравнение вариантов**")
-                rows = []
-                for v in VARIANTS:
-                    p = W.plan(z["id"], v, ov_of(z["id"]))
-                    rows.append({"Вариант": v, "Стоимость, ₸": round(p["estimate"]["total"]),
-                                 "Деревьев": sum(l["qty"] for l in p["lines"] if l["type"] == "дерево"),
-                                 "Кустарников": sum(l["qty"] for l in p["lines"] if l["type"] == "кустарник"),
-                                 "Приживаемость 3 г.": f"{(p['avg_surv']['p3'] or 0):.0%}", "CO₂ за 20 лет, т": round(p["eco"]["co2_cum20_t"], 1),
-                                 "₸ за т CO₂": round(p["eco"]["cost_per_t"] or 0)})
-                st.dataframe(pd.DataFrame(rows), hide_index=True, **WIDE)
-            with tabs[2]:
-                est = plan["estimate"]
-                st.metric("Итого (оценка)", fmt_tg(est["total"]))
-                st.dataframe(est["table"], hide_index=True, **WIDE,
-                             column_config={"Доля": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.2f"),
-                                            "Сумма, ₸": st.column_config.NumberColumn(format="%d")})
-                chart(est["table"].set_index("Статья")["Сумма, ₸"])
-                st.caption("Расценки — «Справочники». Источник: " + SRC_PRICE)
-            with tabs[3]:
-                M = train_survival_model()
-                st.dataframe(surv_t, hide_index=True, **WIDE,
-                             column_config={k: st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.2f") for k in ["1 год", "2 год", "3 год"]})
-                st.caption(f"Метод: 50% экспертные правила + 50% GradientBoosting (scikit-learn). ROC-AUC на тесте: {M['auc']} (правила {M['auc_rule']}) — "
-                           f"на СИНТЕТИЧЕСКИХ данных; нужна калибровка на данных акимата или подтверждение экспертом.")
-                if plan["lines"]:
-                    sp = st.selectbox("Факторы и меры для вида", [l["name"] for l in plan["lines"]], key=f"surv_sp_{z['id']}_{variant}_{len(ss.ov.get(z['id'], {}).get('replace', {}))}")
-                    l = next((x for x in plan["lines"] if x["name"] == sp), plan["lines"][0])
-                    cdf = pd.DataFrame([{"Фактор": FEAT_RU[k], "Вклад, п.п.": v} for k, v in l["surv"]["contrib"].items() if abs(v) >= 0.1]).sort_values("Вклад, п.п.")
-                    if len(cdf):
-                        chart(cdf.set_index("Фактор"))
-                    st.caption(f"Вклад правил относительно идеальных условий. Диапазон 1-го года: {l['surv']['lo']:.0%}–{l['surv']['hi']:.0%}, уверенность — {l['surv']['conf']}.")
-                    V = plan["V"]
-                    base = l["surv"]["p3"]
-                    zi = dict(z); zi.update(salinity=round(z["salinity"] * 0.6, 1), fertility=min(5, z["fertility"] + 1), ph=round(z["ph"] - 0.5 if z["ph"] > 7.5 else z["ph"], 1))
-                    meas = [("Улучшение почвы (гипс/промывка, грунт, удобрения)", predict_survival(l["plant"], zi, V["watering"], V["age"], V["care_years"])["p3"]),
-                            ("Интенсивный полив", predict_survival(l["plant"], z, 2, V["age"], V["care_years"])["p3"]),
-                            ("Саженец 3–4 года + уход 3 года", predict_survival(l["plant"], z, V["watering"], 3, 3)["p3"])]
-                    alt = [(p, predict_survival(p, z, V["watering"], V["age"], V["care_years"])["p3"]) for p in C["plants"]
-                           if p["type"] == l["type"] and p["name"] != l["name"] and suitability(p, z, C["coeffs"])[0] is not None]
-                    if alt:
-                        bp, bv = max(alt, key=lambda t: t[1])
-                        meas.append((f"Замена на «{bp['name']}»", bv))
-                    st.dataframe(pd.DataFrame([{"Мера": a, "Приживаемость 3 г.": f"{b:.0%}", "Изменение, п.п.": round((b - base) * 100, 1)} for a, b in meas]),
-                                 hide_index=True, **WIDE)
-                st.markdown("**Календарь ухода (1-й год)**")
-                mv = st.slider("Допустимо выездов бригады в месяц", 2, 12, 6, key="max_visits")
-                care_df, warns = care_calendar(plan, z, mv)
-                for w in warns:
-                    st.warning(w)
-                st.caption(f"Бюджет ухода по смете: {fmt_tg(plan['estimate']['care_per_year'])} в год · режим полива: {WATER_RU[plan['V']['watering']]}")
-                st.dataframe(care_df, hide_index=True, **WIDE, height=300)
-            with tabs[4]:
-                e = plan["eco"]
-                st.caption("ОЦЕНКА. Коэффициенты и допущения — «Справочники».")
-                cols = st.columns(3)
-                for c_, Y in zip(cols, (5, 10, 20)):
-                    v = e["by_year"][Y]
-                    c_.metric(f"CO₂ через {Y} лет", f"{v['co2_t']:.1f} т/год")
-                    c_.caption(f"O₂ {v['o2_t']:.1f} т/год · пыль {v['dust_kg']:.0f} кг/год · t° −{v['cooling_c']:.2f} °C · осадки {v['rain_m3']:.0f} м³/год")
-                st.dataframe(eco_t, hide_index=True, **WIDE)
-                b = e["before"]
-                a20 = e["by_year"][20]
-                st.markdown(f"**До / после (20 лет):** доля зелени {b['green_share']:.0%} → {a20['green_share_after']:.0%}; "
-                            + (f"зелень на жителя {b['gpc']:.1f} → {a20['gpc_after']:.1f} м²/чел; " if b["gpc"] else "")
-                            + f"t° поверхности {b['lst']} → ≈{b['lst'] - a20['cooling_c']:.1f} °C")
-                st.metric("Стоимость единицы эффекта", f"{fmt_tg(e['cost_per_t'] or 0)} за 1 т CO₂", help=f"Смета / CO₂ за 20 лет ({e['co2_cum20_t']:.1f} т)")
-                chart_line(pd.DataFrame({"CO₂, т/год": [eco_effect(plan, z, C, (Y,))["by_year"][Y]["co2_t"] for Y in range(1, 21)]}, index=range(1, 21)))
-            with tabs[5]:
-                st.caption("Собственная идея: расчёт защитной полосы вдоль ближайших дорог (буфер, виды, стоимость) — для школ, больниц и жилья у магистралей.")
-                if not z["near_roads"]:
-                    st.info("В радиусе 400 м дорог нет.")
-                else:
-                    rr = [(d, next(r for r in W.roads if r["rid"] == rid)) for d, rid in z["near_roads"]]
-                    st.dataframe(pd.DataFrame([{"Дорога": r["rid"], "Название": r["name"], "Класс": ROAD_CLASSES.get(r["highway"], (r["highway"],))[0],
-                                                "До зоны, м": d, "Длина, м": r.get("len_m")} for d, r in rr]), hide_index=True, **WIDE)
-                    d0, r0 = rr[0]
-                    L = min(r0.get("len_m", 0), 2 * math.sqrt(z["area_m2"]))
-                    good = sorted([p for p in C["plants"] if p["type"] != "газон" and p["pollution_tol"] >= 4 and suitability(p, z, C["coeffs"])[0] is not None],
-                                  key=lambda p: -suitability(p, z, C["coeffs"])[0])
-                    tr = [p for p in good if p["type"] == "дерево"][:2]
-                    sh = [p for p in good if p["type"] == "кустарник"][:1]
-                    n_tr = int(L / 6) * 2 if tr else 0
-                    n_sh = int(L / 0.7) if sh else 0
-                    cost = n_tr * (np.mean([p["price"] for p in tr]) if tr else 0) + n_sh * (sh[0]["price"] if sh else 0) + n_tr * C["rates"]["plant_tree"] + n_sh * C["rates"]["plant_shrub"]
-                    st.markdown(f"**Защитная полоса со стороны «{r0['name']}»** (длина участка ≈ {L:.0f} м, ширина 10–15 м): "
-                                f"2 ряда деревьев через 6 м — **{n_tr} шт.** ({', '.join(p['name'] for p in tr) or 'нет подходящих'}), "
-                                f"живая изгородь — **{n_sh} шт.** ({', '.join(p['name'] for p in sh) or 'нет подходящих'}). "
-                                f"Стоимость посадки ≈ **{fmt_tg(cost)}** (оценка, без ухода).")
-            with tabs[6]:
-                rkey = (z["id"], variant, json.dumps(ov_of(z["id"]), sort_keys=True, ensure_ascii=False), ss.get("care_years"), ss.data_ver)
-                if st.button("📄 Сформировать отчёты по зоне"):
-                    pr = W.priorities(ss.weights)
-                    care_df, _ = care_calendar(plan, z, ss.get("max_visits", 6))
-                    with st.spinner("Формирование…"):
-                        ss.reports = dict(key=rkey, xlsx=make_excel(W, z["id"], plan, pr, care_df), pdf=make_pdf(W, z["id"], plan, pr, care_df),
-                                          html=make_html(W, z["id"], plan, pr, care_df))
-                rep_ = ss.get("reports")
-                if rep_ and rep_["key"] == rkey:
-                    st.download_button("⬇️ Excel (подбор, смета, приживаемость, уход, эффект, проблемы, приоритеты)", rep_["xlsx"], f"otchet_{z['id']}.xlsx")
-                    if rep_["pdf"]:
-                        st.download_button("⬇️ PDF-отчёт", rep_["pdf"], f"otchet_{z['id']}.pdf", mime="application/pdf")
-                    else:
-                        st.caption("PDF недоступен (нужны reportlab и шрифт с кириллицей). Используйте HTML → печать в PDF.")
-                    st.download_button("⬇️ HTML-отчёт", rep_["html"], f"otchet_{z['id']}.html", mime="text/html")
-                else:
-                    st.caption("Нажмите кнопку, чтобы сформировать Excel, PDF и HTML для текущего варианта.")
+            with st.expander(f"Исключено ограничениями: {len(plan['rejected'])}"):
+                st.dataframe(pd.DataFrame(plan["rejected"]), hide_index=True, **WIDE)
+        with tabs[2]:
+            est = plan["estimate"]
+            st.metric("Итого (оценка)", fmt_tg(est["total"]))
+            st.dataframe(est["table"], hide_index=True, **WIDE,
+                         column_config={"Доля": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.2f"),
+                                        "Сумма, ₸": st.column_config.NumberColumn(format="%d")})
+            chart(est["table"].set_index("Статья")["Сумма, ₸"])
+            st.caption("Расценки — «Справочники». Источник: " + SRC_PRICE)
+        with tabs[3]:
+            M = train_survival_model()
+            st.dataframe(surv_t, hide_index=True, **WIDE,
+                         column_config={k: st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.2f") for k in ["1 год", "2 год", "3 год"]})
+            st.caption(f"Метод: 50% экспертные правила + 50% GradientBoosting (scikit-learn). ROC-AUC на тесте: {M['auc']} (правила {M['auc_rule']}) — "
+                       f"на СИНТЕТИЧЕСКИХ данных; нужна калибровка на данных акимата или подтверждение экспертом.")
+            if plan["lines"]:
+                sp = st.selectbox("Факторы и меры для вида", [l["name"] for l in plan["lines"]], key=f"surv_sp_{z['id']}_{variant}_{len(ov_of(z['id'])['replace'])}")
+                l = next((x for x in plan["lines"] if x["name"] == sp), plan["lines"][0])
+                cdf = pd.DataFrame([{"Фактор": FEAT_RU[k], "Вклад, п.п.": v} for k, v in l["surv"]["contrib"].items() if abs(v) >= 0.1])
+                if len(cdf):
+                    chart(cdf.sort_values("Вклад, п.п.").set_index("Фактор"))
+                V = plan["V"]
+                base = l["surv"]["p3"]
+                zi = dict(z); zi.update(salinity=round(z["salinity"] * 0.6, 1), fertility=min(5, z["fertility"] + 1), ph=round(z["ph"] - 0.5 if z["ph"] > 7.5 else z["ph"], 1))
+                meas = [("Улучшение почвы (гипс/промывка, грунт, удобрения)", predict_survival(l["plant"], zi, V["watering"], V["age"], V["care_years"])["p3"]),
+                        ("Интенсивный полив", predict_survival(l["plant"], z, 2, V["age"], V["care_years"])["p3"]),
+                        ("Саженец 3–4 года + уход 3 года", predict_survival(l["plant"], z, V["watering"], 3, 3)["p3"])]
+                alt = [(p, predict_survival(p, z, V["watering"], V["age"], V["care_years"])["p3"]) for p in C["plants"]
+                       if p["type"] == l["type"] and p["name"] != l["name"] and suitability(p, z, C["coeffs"])[0] is not None]
+                if alt:
+                    bp, bv = max(alt, key=lambda t: t[1])
+                    meas.append((f"Замена на «{bp['name']}»", bv))
+                st.dataframe(pd.DataFrame([{"Мера": a, "Приживаемость 3 г.": f"{b:.0%}", "Изменение, п.п.": round((b - base) * 100, 1)} for a, b in meas]),
+                             hide_index=True, **WIDE)
+            st.markdown("**Календарь ухода (1-й год)**")
+            mv = st.slider("Допустимо выездов бригады в месяц", 2, 12, 6, key="max_visits")
+            care_df, warns = care_calendar(plan, z, mv)
+            for w in warns:
+                st.warning(w)
+            st.caption(f"Бюджет ухода по смете: {fmt_tg(plan['estimate']['care_per_year'])} в год · режим полива: {WATER_RU[plan['V']['watering']]}")
+            st.dataframe(care_df, hide_index=True, **WIDE, height=300)
+        with tabs[4]:
+            e = plan["eco"]
+            cols = st.columns(3)
+            for c_, Y in zip(cols, (5, 10, 20)):
+                v = e["by_year"][Y]
+                c_.metric(f"CO₂ через {Y} лет", f"{v['co2_t']:.1f} т/год")
+                c_.caption(f"O₂ {v['o2_t']:.1f} т/год · пыль {v['dust_kg']:.0f} кг/год · t° −{v['cooling_c']:.2f} °C · осадки {v['rain_m3']:.0f} м³/год")
+            st.dataframe(eco_t, hide_index=True, **WIDE)
+            b = e["before"]; a20 = e["by_year"][20]
+            st.markdown(f"**До / после (20 лет):** доля зелени {b['green_share']:.0%} → {a20['green_share_after']:.0%}; "
+                        + (f"зелень на жителя {b['gpc']:.1f} → {a20['gpc_after']:.1f} м²/чел; " if b["gpc"] else "")
+                        + f"t° поверхности {b['lst']} → ≈{b['lst'] - a20['cooling_c']:.1f} °C · стоимость {fmt_tg(e['cost_per_t'] or 0)} за 1 т CO₂ (оценка)")
+        with tabs[5]:
+            st.caption("Расчёт защитной полосы вдоль ближайших дорог (буфер, виды, стоимость) — для школ, больниц и жилья у магистралей.")
+            if not z["near_roads"]:
+                st.info("В радиусе 400 м дорог нет.")
+            else:
+                rr = [(d, next(r for r in W.roads if r["rid"] == rid)) for d, rid in z["near_roads"]]
+                st.dataframe(pd.DataFrame([{"Дорога": r["rid"], "Название": r["name"], "Класс": ROAD_CLASSES.get(r["highway"], (r["highway"],))[0],
+                                            "До зоны, м": d, "Длина, м": r.get("len_m")} for d, r in rr]), hide_index=True, **WIDE)
+                d0, r0 = rr[0]
+                L_ = min(r0.get("len_m", 0), 2 * math.sqrt(z["area_m2"]))
+                good = sorted([p for p in C["plants"] if p["type"] != "газон" and p["pollution_tol"] >= 4 and suitability(p, z, C["coeffs"])[0] is not None],
+                              key=lambda p: -suitability(p, z, C["coeffs"])[0])
+                tr = [p for p in good if p["type"] == "дерево"][:2]
+                sh = [p for p in good if p["type"] == "кустарник"][:1]
+                n_tr = int(L_ / 6) * 2 if tr else 0
+                n_sh = int(L_ / 0.7) if sh else 0
+                cost = n_tr * (np.mean([p["price"] for p in tr]) if tr else 0) + n_sh * (sh[0]["price"] if sh else 0) + n_tr * C["rates"]["plant_tree"] + n_sh * C["rates"]["plant_shrub"]
+                st.markdown(f"**Защитная полоса со стороны «{r0['name']}»** ({'OSM' if W.roads_real else SYN}; длина ≈ {L_:.0f} м, ширина 10–15 м): "
+                            f"2 ряда деревьев через 6 м — **{n_tr} шт.** ({', '.join(p['name'] for p in tr) or 'нет подходящих'}), "
+                            f"живая изгородь — **{n_sh} шт.** ({', '.join(p['name'] for p in sh) or 'нет подходящих'}). Стоимость посадки ≈ **{fmt_tg(cost)}** (оценка).")
+        with tabs[6]:
+            rkey = (z["id"], variant, json.dumps(ov_of(z["id"]), sort_keys=True, ensure_ascii=False), ss.get("care_years"), ss.data_ver)
+            if st.button("📄 Сформировать отчёты по участку"):
+                pr = W.priorities(ss.weights)
+                care_df, _ = care_calendar(plan, z, ss.get("max_visits", 6))
+                with st.spinner("Формирование…"):
+                    ss.reports = dict(key=rkey, xlsx=make_excel(W, z["id"], plan, pr, care_df), pdf=make_pdf(W, z["id"], plan, pr, care_df),
+                                      html=make_html(W, z["id"], plan, pr, care_df))
+            rep_ = ss.get("reports")
+            if rep_ and rep_["key"] == rkey:
+                st.download_button("⬇️ Excel (подбор, смета, приживаемость, уход, эффект, проблемы, приоритеты)", rep_["xlsx"], f"otchet_{z['id']}.xlsx")
+                if rep_["pdf"]:
+                    st.download_button("⬇️ PDF-отчёт", rep_["pdf"], f"otchet_{z['id']}.pdf", mime="application/pdf")
+                st.download_button("⬇️ HTML-отчёт", rep_["html"], f"otchet_{z['id']}.html", mime="text/html")
+            else:
+                st.caption("Нажмите кнопку, чтобы сформировать Excel, PDF и HTML для текущего сценария.")
 
-    elif page == "⚠️ Проблемные зоны":
-        st.header("Проблемные зоны")
+    elif page == PAGES[1]:
+        st.subheader("Реестр проблемных зон озеленения Павлодара")
         df = W.problems_df()
         if df.empty:
             st.success("Проблем не выявлено")
@@ -2145,49 +2471,17 @@ Z.forEach(z => new mapgl.Polygon(map, {{coordinates: z.coords, color: z.col + '6
             if f3: mask &= df["Район"].isin(f3)
             d = df[mask]
             a, b, c = st.columns(3)
-            a.metric("Проблем", len(d)); b.metric("Высокой остроты", int((d["Острота"] == "высокая").sum())); c.metric("Зон", d["Зона"].nunique())
-            st.dataframe(d, hide_index=True, **WIDE, height=420)
+            a.metric("Проблем", len(d)); b.metric("Высокой остроты", int((d["Острота"] == "высокая").sum())); c.metric("Участков", d["Зона"].nunique())
+            st.dataframe(d, hide_index=True, **WIDE, height=400)
             chart(d["Проблема"].value_counts())
             cols = st.columns(8)
             for i, zid in enumerate(d["Зона"].unique()[:16]):
                 cols[i % 8].button(f"📍{zid}", key=f"pz_{zid}", on_click=goto_zone, args=(zid,))
-            m = build_map(["Проблемные зоны", "Приоритеты"], "Светлая (Carto)", zoom=12)
+            m = build_map(["Проблемные зоны", "Граф дорог (OSM)"], list(BASEMAPS)[0], zoom=12)
             handle_map_output(show_map(m, key=f"pmap_{ss.data_ver}", height=480))
 
-    elif page == "📊 Приоритеты и бюджет":
-        st.header("Приоритет зон (0–100)")
-        st.caption("Веса настраиваются; пересчёт мгновенный. Вклад факторов показан для каждой зоны.")
-        cols = st.columns(len(FACTORS))
-        for c_, (k, n, _) in zip(cols, FACTORS):
-            ss.weights[k] = c_.slider(n, 0, 50, int(ss.weights[k]), key=f"w_{k}")
-        pr = W.priorities(ss.weights)
-        show = pr[["Ранг", "id", "district", "purpose", "priority"] + [f"c_{k}" for k, _, _ in FACTORS]].rename(
-            columns={"id": "Зона", "district": "Район", "purpose": "Назначение", "priority": "Приоритет", **{f"c_{k}": n for k, n, _ in FACTORS}})
-        st.dataframe(show, hide_index=True, **WIDE, height=380,
-                     column_config={"Приоритет": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f")})
-        st.markdown("**Вклад факторов (топ-12)**")
-        chart(show.head(12).set_index("Зона")[[n for _, n, _ in FACTORS]])
-        st.divider()
-        st.subheader("Дорожная карта под бюджет («лучшее на сумму N»)")
-        b = st.number_input("Бюджет, ₸", min_value=1_000_000, value=50_000_000, step=5_000_000)
-        rd, spent = budget_roadmap(W.zones, W.all_plans(), pr, b)
-        if rd.empty:
-            st.warning("Бюджета не хватает ни на один проект.")
-        else:
-            a, b2, c = st.columns(3)
-            a.metric("Зон в плане", len(rd)); b2.metric("Использовано", fmt_tg(spent)); c.metric("CO₂ за 20 лет", f"{rd["CO₂ за 20 лет, т"].sum():.0f} т")
-            st.dataframe(rd, hide_index=True, **WIDE)
-            cols = st.columns(8)
-            for i, zid in enumerate(rd["Зона"][:16]):
-                cols[i % 8].button(f"📍{zid}", key=f"bz_{zid}", on_click=goto_zone, args=(zid,))
-            bio = io.BytesIO()
-            with pd.ExcelWriter(bio, engine="openpyxl") as xw:
-                show.to_excel(xw, sheet_name="Приоритеты", index=False); rd.to_excel(xw, sheet_name="Дорожная карта", index=False)
-                W.problems_df().to_excel(xw, sheet_name="Проблемные зоны", index=False); assumptions_df(W).to_excel(xw, sheet_name="Допущения", index=False)
-            st.download_button("⬇️ Excel: приоритеты, дорожная карта, проблемные зоны", bio.getvalue(), "prioritety.xlsx")
-
-    elif page == "🌿 Каталог растений":
-        st.header("Каталог растений")
+    elif page == PAGES[2]:
+        st.subheader("Каталог районированных растений")
         df = ss.plants_df
         c1, c2, c3, c4 = st.columns(4)
         qs = c1.text_input("Поиск")
@@ -2198,30 +2492,160 @@ Z.forEach(z => new mapgl.Polygon(map, {{coordinates: z.coords, color: z.col + '6
         if tp: d = d[d["type"].isin(tp)]
         d = d[d["drought"] >= dr]
         if sf: d = d[~d["allergen"] & ~d["toxic"]]
-        st.dataframe(d.rename(columns=PLANT_RU), hide_index=True, **WIDE, height=520)
+        ic = {"дерево": "🌳", "кустарник": "🌿", "газон": "🌱"}
+        cols = st.columns(4)
+        for i, p in enumerate(d.to_dict("records")):
+            flags = ("⚠️ аллерген " if p["allergen"] else "") + ("☠️ ядовит " if p["toxic"] else "") + ("🚫 инвазивный" if p["invasive"] else "")
+            cols[i % 4].markdown(f"""<div class="gz-card" style="margin-bottom:8px"><div style="font-weight:700;color:#0f172a;font-size:13px">{ic.get(p['type'], '')} {p['name']}</div>
+<div class="s"><i>{p['latin']}</i> · {p['type']}</div>
+<div class="s" style="margin-top:4px">Зимостойкость USDA {p['usda']} · засухоуст. {p['drought']}/5 · соль до {p['salt_tol']} дСм/м · pH {p['ph_min']}–{p['ph_max']}</div>
+<div class="s">Газоустойч. {p['pollution_tol']}/5 · высота {p['height_m']} м · CO₂ {p['co2_kg']} кг/год</div>
+<div style="display:flex;justify-content:space-between;margin-top:4px"><b style="font-family:'JetBrains Mono';color:#047857">{fmt_tg(p['price'])}</b><span class="s" style="color:#dc2626">{flags}</span></div></div>""",
+                                 unsafe_allow_html=True)
+        with st.expander("Таблица"):
+            st.dataframe(d.rename(columns=PLANT_RU), hide_index=True, **WIDE, height=420)
         st.caption(f"Источник: {SRC_PLANT}. Цены — {SRC_PRICE}. Редактирование — «Справочники» (администратор).")
 
-    elif page == "📈 Дашборд":
-        st.header("Состояние города")
+    elif page == PAGES[3]:
+        st.subheader("Матрица приоритетов и бюджетная оптимизация")
+        st.caption("Многокритериальный индекс 0–100. Веса нормируются к 100%; пересчёт мгновенный.")
+        lcol, rcol = st.columns([2, 1])
+        with lcol:
+            hc1, hc2 = st.columns([4, 1])
+            if hc2.button("Сброс по умолчанию"):
+                for k, _, w in FACTORS:
+                    ss[f"w_{k}"] = w
+            cols = st.columns(3)
+            for i, (k, n, w0) in enumerate(FACTORS):
+                if f"w_{k}" not in ss:
+                    ss[f"w_{k}"] = int(ss.weights[k])
+                ss.weights[k] = cols[i % 3].slider(n, 0, 50, key=f"w_{k}")
+            sw = sum(ss.weights.values()) or 1
+            hc1.markdown("**Весовые коэффициенты (сумма = 100%):** " + " · ".join(f"{n.split()[0]} {ss.weights[k] / sw:.0%}" for k, n, _ in FACTORS))
+            pr = W.priorities(ss.weights)
+            show = pr[["Ранг", "id", "district", "purpose", "priority"] + [f"c_{k}" for k, _, _ in FACTORS]].rename(
+                columns={"id": "Зона", "district": "Район", "purpose": "Назначение", "priority": "Приоритет", **{f"c_{k}": n for k, n, _ in FACTORS}})
+            st.dataframe(show, hide_index=True, **WIDE, height=360,
+                         column_config={"Приоритет": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f")})
+            st.markdown("**Вклад факторов (топ-12)**")
+            chart(show.head(12).set_index("Зона")[[n for _, n, _ in FACTORS]])
+        with rcol:
+            ss.budget = st.number_input("Выделенный бюджет на сезон, ₸", min_value=1_000_000, value=int(ss.budget), step=5_000_000)
+            rd, spent = budget_roadmap(W.zones, W.all_plans(), pr, ss.budget)
+            if rd.empty:
+                st.warning("Бюджета не хватает ни на один проект.")
+            else:
+                pops = sum(W.zone(zid)["pop_density"] * W.zone(zid)["area_ha"] for zid in rd["Зона"])
+                near_kids = sum(1 for zid in rd["Зона"] if re.search("школ|детсад|больниц", W.zone(zid)["social_list"]))
+                st.markdown(f"""<div class="gz-opt"><div class="h">⚡ Оптимизатор бюджета · жадный алгоритм (эффект на ₸)</div>
+<div class="r"><span>Выделенный бюджет:</span><b style="color:#fbbf24">{fmt_tg(ss.budget)}</b></div>
+<div class="r"><span>Охват участков:</span><b>{len(rd)} из {len(W.zones)}</b></div>
+<div class="r"><span>Сумма по сметам:</span><b>{fmt_tg(spent)}</b></div>
+<div class="r"><span>Остаток резерва:</span><b>{fmt_tg(ss.budget - spent)}</b></div>
+<div class="r"><span>CO₂ за 20 лет:</span><b>{rd['CO₂ за 20 лет, т'].sum():.0f} т</b></div>
+<div class="g">✔ Затронет ≈ {pops:,.0f} жителей участков ({'синтетика' if True else ''})</div>
+<div class="g">✔ {near_kids} участк. рядом со школами, детсадами или больницами</div></div>""".replace(",", " "), unsafe_allow_html=True)
+                st.dataframe(rd, hide_index=True, **WIDE)
+                cols = st.columns(4)
+                for i, zid in enumerate(rd["Зона"][:12]):
+                    cols[i % 4].button(f"📍{zid}", key=f"bz_{zid}", on_click=goto_zone, args=(zid,))
+                lst = rd.merge(pd.DataFrame([{"Зона": z_["id"], "Наименование": z_["name"], "Район": z_["district"]} for z_ in W.zones]), on="Зона")
+                doc = (f"<html><head><meta charset='utf-8'><title>Перечень объектов озеленения</title><style>body{{font-family:Arial;margin:32px}}"
+                       f"table{{border-collapse:collapse;font-size:12px}}td,th{{border:1px solid #ccc;padding:4px 6px}}</style></head><body>"
+                       f"<h2>Проект перечня объектов озеленения на сезон (черновик)</h2><p>Бюджет: {fmt_tg(ss.budget)}; по сметам: {fmt_tg(spent)}.</p>"
+                       + lst.to_html(index=False) + f"<p style='font-size:11px;color:#666'>{DISCLAIMER}</p></body></html>")
+                st.download_button("📄 Перечень объектов (проект)", doc.encode("utf-8"), "perechen_obektov.html", mime="text/html", **WIDE)
+                bio = io.BytesIO()
+                with pd.ExcelWriter(bio, engine="openpyxl") as xw:
+                    show.to_excel(xw, sheet_name="Приоритеты", index=False); rd.to_excel(xw, sheet_name="Дорожная карта", index=False)
+                    W.problems_df().to_excel(xw, sheet_name="Проблемные зоны", index=False); assumptions_df(W).to_excel(xw, sheet_name="Допущения", index=False)
+                st.download_button("⬇️ Excel: приоритеты, план, проблемы", bio.getvalue(), "prioritety.xlsx", **WIDE)
+
+    elif page == PAGES[4]:
+        st.subheader("Долгосрочный экологический эффект и структура затрат")
+        scope = st.radio("Охват", ["Выбранный участок", "Дорожная карта под бюджет", "Все участки города"], horizontal=True, key="eco_scope")
+        if scope == "Выбранный участок":
+            zids = [ss.selected]
+        elif scope == "Дорожная карта под бюджет":
+            zids = list(budget_roadmap(W.zones, W.all_plans(), W.priorities(ss.weights), ss.budget)[0].get("Зона", []))
+        else:
+            zids = [z_["id"] for z_ in W.zones]
+        if not zids:
+            st.warning("Нет участков в выбранном охвате.")
+        else:
+            st.caption(f"Участков: {len(zids)} · сценарий для показателей: «Оптимальный» · прогноз на 5, 10 и 20 лет с учётом роста кроны и выживаемости. Все значения — оценка.")
+            plans = {v: [W.plan(zid, v) for zid in zids] for v in VARIANTS}
+            opt = plans["Оптимальный"]
+            zs = [W.zone(zid) for zid in zids]
+            A = sum(z_["area_m2"] for z_ in zs)
+            pop = sum(z_["pop_density"] * z_["area_ha"] for z_ in zs)
+            g0 = sum(z_["green_share"] * z_["area_m2"] for z_ in zs)
+            y10 = [p["eco"]["by_year"][10] for p in opt]
+            y20 = [p["eco"]["by_year"][20] for p in opt]
+            co2_10 = sum(v["co2_t"] for v in y10)
+            cost = sum(p["estimate"]["total"] for p in opt)
+            cum = sum(p["eco"]["co2_cum20_t"] for p in opt)
+            cool = sum(v["cooling_c"] * z_["area_m2"] for v, z_ in zip(y20, zs)) / A
+            dust = sum(v["dust_kg"] for v in y10) / 1000
+            g1 = g0 + sum(v["green_add_m2"] for v in y20)
+            k1, k2, k3, k4 = st.columns(4)
+            for c_, l_, v_, s_ in [(k1, "Поглощение CO₂ (10 лет)", f"{co2_10:.1f} т/год", f"≈ {fmt_tg(cost / cum if cum else 0)} за тонну CO₂"),
+                                   (k2, "Охлаждение микроклимата", f"−{cool:.2f} °C", "через 20 лет, средневзвешенно"),
+                                   (k3, "Удержание пыли (10 лет)", f"{dust:.2f} т/год", "защитный экран от дорог"),
+                                   (k4, "Обеспеченность зеленью", f"{g1 / pop:.1f} м²/чел" if pop else "—",
+                                    f"рост с {g0 / pop:.1f} м²/чел ({(g1 / g0 - 1) * 100:+.0f}%)" if pop and g0 else "")]:
+                c_.markdown(f'<div class="gz-kpi"><div class="l">{l_}</div><div class="v">{v_}</div><div class="s">{s_}</div></div>', unsafe_allow_html=True)
+            l_, r_ = st.columns([1.3, 1])
+            with l_:
+                st.markdown("**Динамика поглощения CO₂ и выработки O₂, т/год**")
+                yrs = list(range(1, 21))
+                co2s = [sum(eco_effect(p, W.zone(p["zone_id"]), C, (Y,))["by_year"][Y]["co2_t"] for p in opt) for Y in yrs]
+                chart(pd.DataFrame({"CO₂": co2s, "O₂": [c * C["coeffs"]["o2_per_co2"] for c in co2s]}, index=pd.Index(yrs, name="Год")), "line")
+                st.markdown("**Структура затрат («Оптимальный»)**")
+                tot = pd.concat([p["estimate"]["table"].set_index("Статья")["Сумма, ₸"] for p in opt], axis=1).sum(axis=1)
+                chart(tot)
+            with r_:
+                st.markdown("**Сравнение сценариев**")
+                rows = []
+                for v, ps in plans.items():
+                    cst = sum(p["estimate"]["total"] for p in ps)
+                    co = sum(p["eco"]["co2_cum20_t"] for p in ps)
+                    q_ = sum(sum(l["qty"] for l in p["lines"] if l["type"] != "газон") for p in ps)
+                    s3 = sum((p["avg_surv"]["p3"] or 0) * sum(l["qty"] for l in p["lines"] if l["type"] != "газон") for p in ps) / q_ if q_ else 0
+                    rows.append((v, cst, co, s3))
+                best = max(rows, key=lambda r: r[2] / r[1] if r[1] else 0)[0]
+                DESC = {v: f"плотность посадки {VARIANTS[v]['dens']:.0%} от нормы, саженцы {VARIANTS[v]['age']} лет, полив «{WATER_RU[VARIANTS[v]['watering']]}», уход {VARIANTS[v]['care_years']} г."
+                        for v in VARIANTS}
+                for v, cst, co, s3 in rows:
+                    risk = "высокий" if s3 < 0.65 else ("средний" if s3 < 0.8 else "низкий")
+                    st.markdown(f"""<div class="gz-scn {'best' if v == best else ''}" style="margin-bottom:8px"><div style="display:flex;justify-content:space-between">
+<span class="n">Сценарий «{v}»</span>{'<span class="tag">Лучший эффект на ₸</span>' if v == best else ''}</div>
+<div class="c">{fmt_tg(cst)}</div><div>{DESC[v]}</div>
+<div style="margin-top:5px">Приживаемость (3 года): <b>{s3:.0%}</b> · риск отпада: <b>{risk}</b><br>CO₂ за 20 лет: <b>{co:.0f} т</b> · {fmt_tg(cst / co if co else 0)} за т</div></div>""",
+                                unsafe_allow_html=True)
+
+    elif page == PAGES[5]:
+        st.subheader("Состояние города")
         pr = W.priorities(ss.weights)
         pdf_ = W.problems_df()
         opt = W.opt_plans()
         a, b, c, d, e = st.columns(5)
-        a.metric("Зон", len(W.zones))
-        b.metric("Площадь зон", f"{sum(z['area_ha'] for z in W.zones):.1f} га")
+        a.metric("Участков", len(W.zones))
+        b.metric("Площадь участков", f"{sum(z['area_ha'] for z in W.zones):.1f} га")
         c.metric("Средняя доля зелени", f"{np.mean([z['green_share'] for z in W.zones]):.0%}")
         d.metric("Проблем высокой остроты", int((pdf_["Острота"] == "высокая").sum()) if len(pdf_) else 0)
-        e.metric("Стоимость «Оптимальный» по городу", f"{sum(p['estimate']['total'] for p in opt.values()) / 1e6:.0f} млн ₸")
+        e.metric("«Оптимальный» по городу", f"{sum(p['estimate']['total'] for p in opt.values()) / 1e6:.0f} млн ₸")
         l, r = st.columns(2)
         with l:
-            st.markdown("**Приоритет по зонам**")
+            st.markdown("**Приоритет по участкам**")
             chart(pr.set_index("id")["priority"])
             st.markdown("**Проблемы по типам**")
             if len(pdf_): chart(pdf_["Проблема"].value_counts())
         with r:
-            st.markdown("**Эффект по годам, если реализовать «Оптимальный» во всех зонах (оценка)**")
+            st.markdown("**Эффект по годам при реализации «Оптимальный» во всех участках (оценка)**")
             yrs = list(range(1, 21))
-            chart_area(pd.DataFrame({"CO₂, т/год": [sum(eco_effect(p, W.zone(zid), C, (Y,))["by_year"][Y]["co2_t"] for zid, p in opt.items()) for Y in yrs]}, index=yrs))
+            chart(pd.DataFrame({"CO₂, т/год": [sum(eco_effect(p, W.zone(zid), C, (Y,))["by_year"][Y]["co2_t"] for zid, p in opt.items()) for Y in yrs]},
+                               index=pd.Index(yrs, name="Год")), "area")
             st.markdown("**Доля зелени по районам: до / после (20 лет)**")
             rows = []
             for dist in sorted({z["district"] for z in W.zones}):
@@ -2230,19 +2654,19 @@ Z.forEach(z => new mapgl.Polygon(map, {{coordinates: z.coords, color: z.col + '6
                 rows.append(dict(Район=dist, До=sum(z["green_share"] * z["area_m2"] for z in zs) / A,
                                  После=sum(opt[z["id"]]["eco"]["by_year"][20]["green_share_after"] * z["area_m2"] for z in zs) / A))
             chart(pd.DataFrame(rows).set_index("Район"), grouped=True)
-        m = build_map(["Приоритеты", "Проблемные зоны"], "Светлая (Carto)", zoom=12)
+        m = build_map(["Приоритеты", "Проблемные зоны", "Граф дорог (OSM)"], list(BASEMAPS)[0], zoom=12)
         handle_map_output(show_map(m, key=f"dmap_{ss.data_ver}", height=460))
 
-    elif page == "💬 Ассистент":
-        st.header("Диалоговый ассистент")
+    elif page == PAGES[6]:
+        st.subheader("AI-консультант · GIS-ассистент")
         st.caption(f"Ассистент вызывает функции модулей (приоритет, подбор, смета, приживаемость, эффект, бюджет) и ищет по каталогу. "
-                   f"Текущая зона: **{ss.selected}**. Ответы — оценки на основе данных системы; если данных нет — ассистент сообщает.")
+                   f"Текущий участок: **{ss.selected}**. Если данных нет — ассистент сообщает об этом.")
         ex = ["Какие участки в Северном районе требуют озеленения в первую очередь?", "Подбери растения для сквера на этой зоне и посчитай стоимость на 3 года",
-              "Какая будет приживаемость, если заменить клён на липу?", "Что можно озеленить на 5 млн при максимальном эффекте?"]
-        cols = st.columns(4)
+              "Какая будет приживаемость, если заменить клён на липу?", "Что можно озеленить на 5 млн при максимальном эффекте?", "Почему не тополь для этой зоны?"]
+        cols = st.columns(len(ex))
         pending = None
         for c_, e_ in zip(cols, ex):
-            if c_.button(e_, key="ex_" + e_[:10], **WIDE):
+            if c_.button(e_, key="ex_" + e_[:12], **WIDE):
                 pending = e_
         for i, h in enumerate(ss.history):
             with st.chat_message("user"):
@@ -2256,41 +2680,39 @@ Z.forEach(z => new mapgl.Polygon(map, {{coordinates: z.coords, color: z.col + '6
                         cc[j].button(f"📍 {zid}", key=f"ch_{i}_{zid}", on_click=goto_zone, args=(zid,))
         q = st.chat_input("Спросите об озеленении…") or pending
         if q:
-            ans, zl, tool = assistant_answer(q, W, ss.selected, ss.weights)
-            ss.history.append(dict(t=datetime.datetime.now().strftime("%H:%M:%S"), q=q, a=ans, zones=zl, tool=tool))
+            ask(q)
             st.rerun()
 
-    elif page == "📥 Загрузка данных":
-        st.header("Загрузка данных")
-        st.subheader("1. Дороги и соцобъекты из OpenStreetMap")
-        st.caption("Overpass API: highway=* (магистрали … пешеходные), атрибуты name, highway, lanes, surface, oneway, maxspeed, bridge, tunnel. "
-                   "Кэшируется в data/osm_roads.json. Данные © OpenStreetMap contributors (ODbL).")
+    elif page == PAGES[7]:
+        st.subheader("Загрузка данных")
+        st.markdown("**1. Дороги и соцобъекты из OpenStreetMap (для аналитики)**")
+        st.caption("На карте улицы OSM загружаются автоматически в браузере. Для расчётов (расстояние до дороги, класс, загрязнение, защитные полосы) "
+                   "сервер загружает граф через Overpass API при старте и кэширует его в data/osm_roads.json. Данные © OpenStreetMap contributors (ODbL).")
         c1, c2 = st.columns(2)
-        if c1.button("⬇️ Загрузить дороги OSM", disabled=role == "Просмотр"):
+        if c1.button("🔄 Обновить дороги OSM", disabled=role == "Просмотр"):
             try:
-                with st.spinner("Загрузка из Overpass (до 2 мин)…"):
+                with st.spinner("Загрузка из Overpass…"):
                     ss.osm_roads = fetch_osm_roads()
                 st.success(f"Загружено сегментов: {len(ss.osm_roads)}"); bump(); st.rerun()
             except Exception as e:
-                st.error(f"Overpass недоступен: {e}. Остаются синтетические дороги (подложка карты всё равно показывает реальные).")
-        if c2.button("⬇️ Загрузить школы/детсады/больницы OSM", disabled=role == "Просмотр"):
+                st.error(f"Overpass недоступен с сервера: {e}. Аналитика использует синтетические расстояния (помечено).")
+        if c2.button("🔄 Загрузить школы/детсады/больницы OSM", disabled=role == "Просмотр"):
             try:
                 with st.spinner("Загрузка…"):
                     ss.osm_social = fetch_osm_social()
                 st.success(f"Объектов: {len(ss.osm_social)}"); bump(); st.rerun()
             except Exception as e:
                 st.error(f"Overpass недоступен: {e}")
-        st.write(f"Сейчас: дорог {len(W.roads)} ({'OSM' if W.roads_real else SYN}), соцобъектов {len(W.social)} ({'OSM' if W.social_real else SYN}).")
-        st.subheader("2. Зоны из файла")
-        st.caption("GeoJSON, KML, CSV (lat/lon), Shapefile (zip). Метрические координаты приводятся к EPSG:4326 (по умолчанию UTM 43N, EPSG:32643). "
-                   "Атрибуты: purpose/назначение, name, green_share, pop_density.")
+        st.write(f"Сейчас для аналитики: дорог {len(W.roads)} ({'OSM' if W.roads_real else SYN}), соцобъектов {len(W.social)} ({'OSM' if W.social_real else SYN}).")
+        st.markdown("**2. Участки из файла**")
+        st.caption("GeoJSON, KML, CSV (lat/lon), Shapefile (zip). Метрические координаты приводятся к EPSG:4326 (по умолчанию UTM 43N, EPSG:32643).")
         f = st.file_uploader("Файл", type=["geojson", "json", "kml", "csv", "zip"], disabled=role == "Просмотр")
         if f:
             objs, issues = parse_upload(f.name, f.getvalue())
             for o in objs:
                 for z in W.zones:
                     if polys_overlap(o["ring"], z["ring"]):
-                        issues.append(f"«{o['props'].get('name', '?')}» пересекается с существующей зоной {z['id']}")
+                        issues.append(f"«{o['props'].get('name', '?')}» пересекается с существующим участком {z['id']}")
                         break
             st.write(f"Объектов: **{len(objs)}**")
             if issues:
@@ -2298,35 +2720,36 @@ Z.forEach(z => new mapgl.Polygon(map, {{coordinates: z.coords, color: z.col + '6
                 st.dataframe(pd.DataFrame({"Проблема": issues}), hide_index=True, **WIDE)
             else:
                 st.success("Проблем не обнаружено")
-            if objs and st.button(f"➕ Добавить {len(objs)} зон"):
+            if objs and st.button(f"➕ Добавить {len(objs)} участков"):
                 for o in objs:
-                    z = W.new_zone_from_ring(o["ring"], o["props"], src=f"файл {f.name}")
-                    ss.extra_zones.append(z)
-                    W.zones.append(W.enrich(dict(z)))
+                    ss.extra_zones.append(W.new_zone_from_ring(o["ring"], o["props"], src=f"файл {f.name}"))
                 bump(); st.rerun()
         st.download_button("Пример GeoJSON", json.dumps({"type": "FeatureCollection", "features": [
             {"type": "Feature", "properties": {"name": "Тестовый сквер", "purpose": "сквер"},
              "geometry": ring_to_geojson(_circle_ring(76.975, 52.29, 50))}]}, ensure_ascii=False), "primer.geojson")
 
-    elif page == "📚 Справочники":
-        st.header("Справочники")
+    elif page == PAGES[8]:
+        st.subheader("Справочники")
         can = role == "Администратор"
         if not can:
             st.info("Редактирование доступно роли «Администратор».")
         for title, key in [("Расценки (₸)", "rates_df"), ("Коэффициенты", "coeffs_df"), ("Каталог растений", "plants_df")]:
-            st.subheader(title)
+            st.markdown(f"**{title}**")
             ed = st.data_editor(ss[key], disabled=not can, **WIDE, key=f"ed_{key}", num_rows="dynamic" if key == "plants_df" else "fixed")
             if can and st.button(f"Сохранить: {title}", key=f"save_{key}"):
                 ss[key] = ed.reset_index(drop=True)
                 bump(); st.success("Сохранено, расчёты обновлены"); st.rerun()
-        st.subheader("Допущения и метод")
+        st.markdown("**Допущения и метод**")
         st.dataframe(assumptions_df(W), hide_index=True, **WIDE)
 
-    elif page == "🕘 История":
-        st.header("История запросов и решений (контекстная память сессии)")
-        st.subheader("Решения")
-        st.dataframe(pd.DataFrame(ss.decisions), hide_index=True, **WIDE) if ss.decisions else st.caption("Пока нет сохранённых решений.")
-        st.subheader("Запросы к ассистенту")
+    elif page == PAGES[9]:
+        st.subheader("История запросов и решений")
+        st.markdown("**Утверждённые в план участки**")
+        if ss.decisions:
+            st.dataframe(pd.DataFrame(ss.decisions), hide_index=True, **WIDE)
+        else:
+            st.caption("Пока нет решений — нажмите «✅ Утвердить в план» в паспорте участка.")
+        st.markdown("**Запросы к ассистенту**")
         if ss.history:
             st.dataframe(pd.DataFrame([{"Время": h["t"], "Вопрос": h["q"], "Инструмент": h["tool"], "Зоны": ", ".join(h["zones"])} for h in ss.history]),
                          hide_index=True, **WIDE)
@@ -2334,22 +2757,23 @@ Z.forEach(z => new mapgl.Polygon(map, {{coordinates: z.coords, color: z.col + '6
         else:
             st.caption("Пока нет запросов.")
 
-    elif page == "❓ Инструкция":
-        st.header("Инструкция (1 страница)")
+    elif page == PAGES[10]:
+        st.subheader("Инструкция (1 страница)")
         st.markdown(f"""
-1. **Выберите зону** на «Карте»: кликните по полигону, выберите в списке, найдите адрес (🔎) или нарисуйте полигон/прямоугольник инструментом слева на карте и нажмите «Создать зону».
-2. **Слои** (почвы, зелень, проблемы, приоритеты, посадки, дороги, соцобъекты) включаются над картой; подложка — OSM/Carto/2ГИС.
-3. В панели зоны выберите **вариант** (эконом / оптимальный / максимальный эффект) и срок ухода.
-   - «Растения» — подбор с пригодностью 0–100 и обоснованием; можно исключить, зафиксировать или заменить вид — всё пересчитывается.
-   - «Смета» — статьи, формулы и доли. «Приживаемость и уход» — прогноз на 1/2/3 года, факторы риска, меры, календарь.
-   - «Эффект» — CO₂, O₂, пыль, t°, осадки на 5/10/20 лет, «до/после», ₸ за т CO₂. «Вдоль дороги» — защитная полоса.
-   - «Отчёт» — Excel, PDF, HTML.
-4. **Проблемные зоны** — таблица с фильтрами и картой. **Приоритеты** — ползунки весов и дорожная карта под бюджет.
-5. **Ассистент** — вопросы на русском; кнопки 📍 открывают зону на карте.
-6. **Загрузка данных** — реальные дороги и соцобъекты из OSM, зоны из файлов с проверкой качества.
-7. **Справочники** — расценки, коэффициенты, каталог (роль «Администратор»).
+1. **ГИС-карта.** Выберите участок кликом, в списке, поиском адреса (🔎) или нарисуйте полигон инструментом слева на карте и нажмите «Создать зону».
+   Улицы — реальная геометрия OpenStreetMap (загружается в браузере); клик по улице показывает класс, длину и расчёт защитной полосы.
+2. **Слои** (дороги, проблемы, посадки, школы/больницы с буфером 150 м, почвы, зелень, приоритеты) включаются галочками над картой.
+3. **Паспорт участка** справа: параметры, AI-рекомендация, приживаемость, смета, кнопки «Утвердить в план», «AI-анализ», «Паспорт».
+   Ниже — подробные вкладки: растения (исключить/зафиксировать/заменить), смета, приживаемость и уход, эффект, защитная полоса, отчёты.
+4. **Проблемные зоны** — реестр с фильтрами. **Матрица приоритетов** — веса и оптимизатор бюджета. **Эффект и смета** — CO₂/O₂ и сценарии.
+5. **AI-консультант** — в боковой панели (кнопка «>» слева вверху) и на отдельной вкладке; кнопки 📍 открывают участок.
+6. **Данные** — обновление OSM и загрузка участков из файлов с проверкой качества. **Справочники** — расценки, коэффициенты, каталог (администратор).
 
 {DISCLAIMER} Данные с пометкой «{SYN}» — демонстрационные; замените их данными организатора.""")
+
+
+PAGES = ["🗺️ ГИС-карта", "⚠️ Проблемные зоны", "🌿 Каталог растений", "🎚️ Матрица приоритетов", "📈 Эффект и смета",
+         "📊 Дашборд", "💬 AI-консультант", "📥 Данные", "📚 Справочники", "🕘 История", "❓ Инструкция"]
 
 
 if __name__ == "__main__":
